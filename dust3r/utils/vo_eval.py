@@ -1,11 +1,15 @@
 import os
+os.environ['MPLBACKEND'] = 'Agg'
+os.environ['EVO_SETTINGS_plot_backend'] = 'Agg'
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import re
 from copy import deepcopy
 from pathlib import Path
 
 import evo.main_ape as main_ape
 import evo.main_rpe as main_rpe
-import matplotlib.pyplot as plt
 import numpy as np
 from evo.core import sync
 from evo.core.metrics import PoseRelation, Unit

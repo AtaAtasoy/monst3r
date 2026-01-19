@@ -11,7 +11,8 @@ from layer import conv3x3
 import math
 
 try:
-    autocast = torch.cuda.amp.autocast
+    from functools import partial
+    autocast = partial(torch.amp.autocast, 'cuda')
 except:
     # dummy autocast for PyTorch < 1.6
     class autocast:

@@ -19,10 +19,12 @@ from dust3r.utils.image import load_images, load_prev_video_results, rgb, enlarg
 from dust3r.utils.device import to_numpy
 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 from dust3r.utils.viz_demo import convert_scene_output_to_glb, get_dynamic_mask_from_pairviewer
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as pl
 import cv2
 
-pl.ion()
+# pl.ion()
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
 
