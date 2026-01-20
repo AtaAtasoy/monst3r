@@ -47,12 +47,20 @@ def convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, c
 
     rot = np.eye(4)
     rot[:3, :3] = Rotation.from_euler('y', np.deg2rad(180)).as_matrix()
-    scene.apply_transform(np.linalg.inv(cams2world[0] @ OPENGL @ rot))
+    transform = np.linalg.inv(cams2world[0] @ OPENGL @ rot)
+    scene.apply_transform(transform)
     if save_name is None: save_name='scene'
     outfile = os.path.join(outdir, save_name+'.glb')
     if not silent:
         print('(exporting 3D scene to', outfile, ')')
     scene.export(file_obj=outfile)
+
+    # export frame-wise point clouds
+    for i in range(len(imgs)):
+        pcd = trimesh.PointCloud(pts3d[i].reshape(-1, 3), colors=imgs[i].reshape(-1, 3))
+        pcd_masked = trimesh.PointCloud(pts3d[i][mask[i]], colors=imgs[i][mask[i]])
+        pcd.export(os.path.join(outdir, f'frame_{i:04d}.ply'))
+        pcd_masked.export(os.path.join(outdir, f'frame_{i:04d}_masked.ply'))
     return outfile
 
 def get_dynamic_mask_from_pairviewer(scene, flow_net=None, both_directions=False, output_dir='./demo_tmp', motion_mask_thre=0.35):
