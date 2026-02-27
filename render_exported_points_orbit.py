@@ -7,15 +7,14 @@ from dreifus.matrix import Intrinsics
 from pytorch3d.structures import Pointclouds
 from pytorch3d.io import IO
 from pytorch3d.renderer import (
-    FoVPerspectiveCameras,
     PointsRasterizationSettings,
     PointsRenderer,
-    PulsarPointsRenderer,
     PointsRasterizer,
     AlphaCompositor,
     PerspectiveCameras,
 )
 import torch
+import open3d as o3d
 
 
 def load_tum_poses(path) -> list[Pose]:
@@ -60,6 +59,62 @@ def load_intrinsics(path) -> list[Intrinsics]:
     return intrinsics
 
 
+def generate_orbit_poses(
+    center: np.ndarray,
+    radius: float,
+    n_views: int,
+    up: np.ndarray = np.array(
+        [0, -1, 0]
+    ),  # The world up hint. Defines which way is up in the world. Should match the up vector of the camera coordinate system.
+    height: float = 0.0,
+) -> list[Pose]:
+    """Generate a turntable/orbit path around center at given radius and height."""
+    angles = np.linspace(-np.pi, 0, n_views, endpoint=False)
+    poses = []
+    # cam_pos = center + [r.cos(theta), height, r.sin(theta)] where theta is in [0, max(angles)], position on the circle
+    for theta in angles:
+        cam_pos = center + np.array(
+            [radius * np.cos(theta), height, radius * np.sin(theta)]
+        )  # this is the translation part of the pose
+
+        forward = (
+            center - cam_pos
+        )  # this is the forward direction of the camera, -z axis in opengl
+        forward /= np.linalg.norm(forward)
+
+        right = np.cross(
+            forward, up
+        )  # this is the right direction of the camera, x axis in opengl, perpendicular to forward and up
+        right /= np.linalg.norm(right)
+
+        true_up = np.cross(
+            right, forward
+        )  # this is the up direction of the camera, y axis in opengl, perpendicular to forward and right
+        true_up /= np.linalg.norm(true_up)
+
+        R_cam = np.stack([right, true_up, -forward], axis=1)
+        poses.append(
+            Pose(
+                np.block(
+                    [
+                        [R_cam, cam_pos.reshape(3, 1)],
+                        [np.zeros((1, 3)), np.ones((1, 1))],
+                    ]
+                ),
+                pose_type=PoseType.CAM_2_WORLD,
+                camera_coordinate_convention=CameraCoordinateConvention.OPEN_GL,
+            )
+        )
+    return poses
+
+
+def fuse_scene_centroid(point_clouds: list[o3d.geometry.PointCloud]) -> np.ndarray:  # ty:ignore[possibly-missing-attribute]
+    all_pts = np.concatenate(
+        [np.asarray(pcd.points) for pcd in point_clouds if len(pcd.points) > 0], axis=0
+    )
+    return all_pts.mean(axis=0)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Render all exported point clouds with poses"
@@ -81,20 +136,37 @@ def main():
     args = parser.parse_args()
     data_path = Path(args.data_dir)
 
-    # Load Poses
-    traj_path = data_path / "pred_traj.txt"
-    poses = load_tum_poses(traj_path)
-    print(f"Loaded {len(poses)} poses.")
-
     # Add Cameras
     intrinsics_path = data_path / "pred_intrinsics.txt"
     intrinsics = load_intrinsics(intrinsics_path)
     print(f"Loaded {len(intrinsics)} intrinsics.")
 
-    assert len(poses) == len(intrinsics), "Number of poses and intrinsics must match."
+    # Load Poses
+    traj_path = data_path / "pred_traj.txt"
+    poses = load_tum_poses(traj_path)
+    print(f"Loaded {len(poses)} poses.")
 
-    num_frames = len(poses)
-    print(f"Processing {num_frames} frames...")
+    # Load Point Clouds for centroid calculation
+    suffix = "_masked" if args.masked else ""
+    point_clouds = [
+        o3d.io.read_point_cloud(str(data_path / f"frame_{i:04d}{suffix}.ply"))
+        for i in range(len(poses))
+    ]
+
+    center = fuse_scene_centroid(point_clouds)
+    radius_multiplier = 1.0
+    radius = radius_multiplier * np.linalg.norm(center - poses[0].get_translation())
+    orbit_poses = generate_orbit_poses(
+        center, radius=float(radius), n_views=len(poses), height=0.0
+    )
+    print(f"Created {len(orbit_poses)} orbit poses.")
+
+    assert len(orbit_poses) == len(intrinsics), (
+        "Number of orbit poses and intrinsics must match."
+    )
+
+    num_frames = len(orbit_poses)
+    print(f"Processing {num_frames} orbit poses...")
 
     points_list = []
     features_list = []
@@ -117,7 +189,7 @@ def main():
         features_list.append(pc.features_list()[0])  # ty:ignore[not-subscriptable]
 
         # 2. Process Pose
-        opencv_c2w_pose: Pose = poses[i]
+        opencv_c2w_pose: Pose = orbit_poses[i]
         pytorch3d_c2w_pose = opencv_c2w_pose.change_camera_coordinate_convention(
             new_camera_coordinate_convention=CameraCoordinateConvention.PYTORCH_3D
         )
@@ -158,81 +230,39 @@ def main():
     T_batch = torch.stack(T_list)
     K_batch = torch.stack(K_list)
 
-    # use_pulsar logic preserved but defaulting to False
-    use_pulsar = False
-
     raster_settings = PointsRasterizationSettings(
         image_size=(args.H, args.W),  # H, W in pixels
         radius=0.01,
     )
 
     print("Rendering...")
-    if use_pulsar:
-        # Use FoVPerspectiveCameras with PulsarPointsRenderer (faster)
-        print("Using FoVPerspectiveCameras with Pulsar backend.")
+    image_size = torch.tensor([[args.H, args.W]], device=device).expand(num_frames, -1)
 
-        # Calculate FOV for all frames
-        fov_list = []
-        for i in range(num_frames):
-            intr = intrinsics[i]
-            fov_y = 2 * np.arctan(args.H / (2 * intr.fy))
-            fov_list.append(np.degrees(fov_y))
+    camera = PerspectiveCameras(
+        in_ndc=False,
+        R=R_batch,
+        T=T_batch,
+        K=K_batch,
+        device=device,
+        image_size=image_size,
+    )
 
-        fov_tensor = torch.tensor(fov_list, dtype=torch.float32, device=device)
+    rasterizer = PointsRasterizer(cameras=camera, raster_settings=raster_settings)
+    renderer = PointsRenderer(
+        rasterizer=rasterizer,
+        compositor=AlphaCompositor(
+            background_color=torch.tensor([0.5, 0.5, 0.5], device=device)
+        ),  # gray background
+    )
 
-        camera = FoVPerspectiveCameras(
-            R=R_batch,
-            T=T_batch,
-            fov=fov_tensor,
-            degrees=True,
-            device=device,
-        )
-
-        rasterizer = PointsRasterizer(cameras=camera, raster_settings=raster_settings)
-        renderer = PulsarPointsRenderer(
-            rasterizer=rasterizer,
-            n_channels=3,
-        ).to(device)
-
-        images = renderer(
-            batch_pc,
-            gamma=(1e-4,),
-            bg_col=torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device=device),
-        )
-        # Pulsar typically returns RGBA or RGB depending on n_channels settings, here n_channels=3
-        # Reference: image = images[0, ..., :3]
-
-    else:
-        # Use PerspectiveCameras with PointsRenderer (supports off-center principal point)
-        print(
-            "Principal point is off-center. Using PerspectiveCameras with PointsRenderer."
-        )
-
-        image_size = torch.tensor([[args.H, args.W]], device=device).expand(
-            num_frames, -1
-        )
-
-        camera = PerspectiveCameras(
-            in_ndc=False,
-            R=R_batch,
-            T=T_batch,
-            K=K_batch,
-            device=device,
-            image_size=image_size,
-        )
-
-        rasterizer = PointsRasterizer(cameras=camera, raster_settings=raster_settings)
-        renderer = PointsRenderer(
-            rasterizer=rasterizer,
-            compositor=AlphaCompositor(),
-        )
-
-        images = renderer(batch_pc)
+    images = renderer(batch_pc)
 
     # Save images
     # Save images
     type_str = "masked" if args.masked else "unmasked"
-    output_dir = data_path / f"{type_str}_reconstruction_renders"
+    output_dir = (
+        data_path / f"{type_str}_gray_background_orbit_renders_{radius_multiplier}"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     images_np = images[..., :3].cpu().numpy()

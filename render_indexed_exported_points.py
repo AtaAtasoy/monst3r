@@ -75,11 +75,10 @@ def main():
     parser.add_argument(
         "--frame_idx", type=int, default=0, help="Frame index to render"
     )
+    parser.add_argument("--H", type=int, default=288, help="Output image height")
+    parser.add_argument("--W", type=int, default=512, help="Output image width")
     parser.add_argument(
-        "--H", type=int, default=288, help="Output image height"
-    )
-    parser.add_argument(
-        "--W", type=int, default=512, help="Output image width"
+        "--masked", action="store_true", help="Render masked point clouds"
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -97,20 +96,23 @@ def main():
     intrinsics = load_intrinsics(intrinsics_path)
     print(f"Loaded {len(intrinsics)} intrinsics.")
 
-    assert len(poses) == len(
-        intrinsics), "Number of poses and intrinsics must match."
+    assert len(poses) == len(intrinsics), "Number of poses and intrinsics must match."
 
+    suffix = "_masked" if args.masked else ""
     point_cloud = IO().load_pointcloud(
-        str(data_path / f"frame_{args.frame_idx:04d}.ply"), device=device)
+        str(data_path / f"frame_{args.frame_idx:04d}{suffix}.ply"), device=device
+    )
 
     # Select camera for rendering
     opencv_c2w_pose: Pose = poses[args.frame_idx]
     pytorch3d_c2w_pose = opencv_c2w_pose.change_camera_coordinate_convention(
-        new_camera_coordinate_convention=CameraCoordinateConvention.PYTORCH_3D)
+        new_camera_coordinate_convention=CameraCoordinateConvention.PYTORCH_3D
+    )
 
     R = pytorch3d_c2w_pose.get_rotation_matrix()
     pytorch3d_w2c_pose = pytorch3d_c2w_pose.change_pose_type(
-        new_pose_type=PoseType.WORLD_2_CAM, inplace=False)
+        new_pose_type=PoseType.WORLD_2_CAM, inplace=False
+    )
     T = pytorch3d_w2c_pose.get_translation()
 
     intrinsics = intrinsics[args.frame_idx]
@@ -120,7 +122,7 @@ def main():
     # cy_centered = abs(intrinsics.cy - args.H / 2) < 1e-3
     # use_pulsar = cx_centered and cy_centered
     use_pulsar = True
-    
+
     raster_settings = PointsRasterizationSettings(
         image_size=(args.H, args.W),  # H, W in pixels
         radius=0.01,
@@ -129,7 +131,8 @@ def main():
     if use_pulsar:
         # Use FoVPerspectiveCameras with PulsarPointsRenderer (faster)
         print(
-            "Principal point is centered. Using FoVPerspectiveCameras with Pulsar backend.")
+            "Principal point is centered. Using FoVPerspectiveCameras with Pulsar backend."
+        )
 
         # Convert focal length (pixels) to FoV (radians), then to degrees
         fov_y = 2 * np.arctan(args.H / (2 * intrinsics.fy))
@@ -143,8 +146,7 @@ def main():
             device=device,
         )
 
-        rasterizer = PointsRasterizer(
-            cameras=camera, raster_settings=raster_settings)
+        rasterizer = PointsRasterizer(cameras=camera, raster_settings=raster_settings)
         renderer = PulsarPointsRenderer(
             rasterizer=rasterizer,
             n_channels=3,
@@ -153,20 +155,27 @@ def main():
         images = renderer(
             point_cloud,
             gamma=(1e-4,),
-            bg_col=torch.tensor([0.0, 0.0, 0.0],
-                                dtype=torch.float32, device=device,)
+            bg_col=torch.tensor(
+                [0.0, 0.0, 0.0],
+                dtype=torch.float32,
+                device=device,
+            ),
         )
     else:
         # Use PerspectiveCameras with PointsRenderer (supports off-center principal point)
         print(
-            "Principal point is off-center. Using PerspectiveCameras with PointsRenderer.")
+            "Principal point is off-center. Using PerspectiveCameras with PointsRenderer."
+        )
 
-        K = torch.tensor([
-            [intrinsics.fx,   0,   intrinsics.cx,   0],
-            [0,   intrinsics.fy,   intrinsics.cy,   0],
-            [0,    0,    0,   1],
-            [0,    0,    1,   0],
-        ], dtype=torch.float32)
+        K = torch.tensor(
+            [
+                [intrinsics.fx, 0, intrinsics.cx, 0],
+                [0, intrinsics.fy, intrinsics.cy, 0],
+                [0, 0, 0, 1],
+                [0, 0, 1, 0],
+            ],
+            dtype=torch.float32,
+        )
 
         image_size = torch.tensor([[args.H, args.W]], device=device)
 
@@ -179,8 +188,7 @@ def main():
             image_size=image_size,
         )
 
-        rasterizer = PointsRasterizer(
-            cameras=camera, raster_settings=raster_settings)
+        rasterizer = PointsRasterizer(cameras=camera, raster_settings=raster_settings)
         renderer = PointsRenderer(
             rasterizer=rasterizer,
             compositor=AlphaCompositor(),
