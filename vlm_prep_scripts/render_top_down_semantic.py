@@ -19,15 +19,8 @@ from pytorch3d.renderer import (
 from pytorch3d.structures import Pointclouds
 
 
-import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 _colormap = cm.get_cmap('viridis')
-_src_colormap = cm.get_cmap('plasma')
-
-
-def src_colormap_color(t):
-    rgb = _src_colormap(t)[:3]
-    return tuple(int(255 * c) for c in rgb)
 
 
 def colormap_color(t):
@@ -218,11 +211,11 @@ def _collect_scene_bounds_in_view(scene_paths: list[Path], topdown_pose: Pose) -
     pytorch3d_c2w_pose = topdown_pose.change_camera_coordinate_convention(
         new_camera_coordinate_convention=CameraCoordinateConvention.PYTORCH_3D
     )
-    r = pytorch3d_c2w_pose.get_rotation_matrix()
+    r = np.asarray(pytorch3d_c2w_pose.get_rotation_matrix(), dtype=np.float64)
     pytorch3d_w2c_pose = pytorch3d_c2w_pose.change_pose_type(
         new_pose_type=PoseType.WORLD_2_CAM, inplace=False
     )
-    t = pytorch3d_w2c_pose.get_translation()
+    t = np.asarray(pytorch3d_w2c_pose.get_translation(), dtype=np.float64)
 
     min_x, max_x = float("inf"), float("-inf")
     min_y, max_y = float("inf"), float("-inf")
@@ -232,11 +225,12 @@ def _collect_scene_bounds_in_view(scene_paths: list[Path], topdown_pose: Pose) -
         pts = cloud.points_list()[0]
         if pts.numel() == 0:
             continue
-        pts_cam = pts @ r.T + t
-        min_x = min(min_x, float(pts_cam[:, 0].min()))
-        max_x = max(max_x, float(pts_cam[:, 0].max()))
-        min_y = min(min_y, float(pts_cam[:, 1].min()))
-        max_y = max(max_y, float(pts_cam[:, 1].max()))
+        pts_np = pts.detach().cpu().numpy().astype(np.float64, copy=False)
+        pts_cam = pts_np @ r.T + t[None, :]
+        min_x = min(min_x, float(np.min(pts_cam[:, 0])))
+        max_x = max(max_x, float(np.max(pts_cam[:, 0])))
+        min_y = min(min_y, float(np.min(pts_cam[:, 1])))
+        max_y = max(max_y, float(np.max(pts_cam[:, 1])))
 
     if not np.isfinite([min_x, max_x, min_y, max_y]).all():
         return 1.0, 1.0
@@ -321,62 +315,6 @@ def _make_orthographic_camera(
 
     half_w *= margin
     half_h *= margin
-
-    fx = (img_w * 0.5) / half_w
-    fy = (img_h * 0.5) / half_h
-    cx = img_w * 0.5
-    cy = img_h * 0.5
-
-    camera = OrthographicCameras(
-        focal_length=((fx, fy),),
-        principal_point=((cx, cy),),
-        R=r[None, :, :],
-        T=t[None, :],
-        in_ndc=False,
-        image_size=((img_h, img_w),),
-        device=device,
-    )
-
-    params = {
-        "focal_length_xy": [float(fx), float(fy)],
-        "principal_point_xy": [float(cx), float(cy)],
-        "view_half_extent_xy": [float(half_w), float(half_h)],
-        "margin": float(margin),
-    }
-    return camera, params
-
-
-def _make_local_orthographic_camera(
-    topdown_pose: Pose,
-    img_w: int,
-    img_h: int,
-    camera_positions_world: np.ndarray,
-    margin: float,
-    *,
-    device: torch.device,
-):
-    """Local view: fit orthographic extents tightly to the camera trajectory only."""
-    pytorch3d_c2w_pose = topdown_pose.change_camera_coordinate_convention(
-        new_camera_coordinate_convention=CameraCoordinateConvention.PYTORCH_3D
-    )
-    r = pytorch3d_c2w_pose.get_rotation_matrix()
-    pytorch3d_w2c_pose = pytorch3d_c2w_pose.change_pose_type(
-        new_pose_type=PoseType.WORLD_2_CAM, inplace=False
-    )
-    t = pytorch3d_w2c_pose.get_translation()
-
-    cam_xyz = np.asarray(camera_positions_world,
-                         dtype=np.float64).reshape(-1, 3)
-    if cam_xyz.size == 0:
-        raise ValueError(
-            "camera_positions_world is empty (trajectory must be present)")
-
-    half_w, half_h = _collect_xyz_bounds_in_view(
-        cam_xyz,
-        topdown_pose,
-    )
-    half_w = max(float(half_w), 1e-4) * float(margin)
-    half_h = max(float(half_h), 1e-4) * float(margin)
 
     fx = (img_w * 0.5) / half_w
     fy = (img_h * 0.5) / half_h
@@ -498,8 +436,70 @@ def _draw_arrow(draw: ImageDraw.ImageDraw, start: tuple[int, int], end: tuple[in
     draw.polygon([end, left, right], fill=color)
 
 
+def _build_camera_frustum_world_points(
+    pose_cam2world: Pose,
+    intr: Intrinsics,
+    *,
+    depth_scale: float,
+) -> np.ndarray:
+    
+    fx = intr.fx
+    fy = intr.fy
+    cx = intr.cx
+    cy = intr.cy
+    
+    
+    img_w, img_h = 2.0 * intr.cx, 2.0 * intr.cy
+    img_w = max(img_w, 1.0)
+    img_h = max(img_h, 1.0)
+
+    # OpenCV camera coordinates: +X right, +Y down, +Z forward.
+    corners_px = np.array(
+        [
+            [0.0, 0.0],
+            [img_w - 1.0, 0.0],
+            [img_w - 1.0, img_h - 1.0],
+            [0.0, img_h - 1.0],
+        ],
+        dtype=np.float64,
+    )
+    z = float(depth_scale)
+    x = (corners_px[:, 0] - cx) / max(fx, 1e-8) * z
+    y = (corners_px[:, 1] - cy) / max(fy, 1e-8) * z
+    corners_cam = np.stack([x, y, np.full_like(x, z)], axis=1)
+
+    frustum_cam = np.concatenate(
+        [np.zeros((1, 3), dtype=np.float64), corners_cam], axis=0
+    )
+    pose_mat = np.asarray(pose_cam2world.numpy(), dtype=np.float64)
+    rot = pose_mat[:3, :3]
+    trans = pose_mat[:3, 3]
+    frustum_world = frustum_cam @ rot.T + trans[None, :]
+    return frustum_world.astype(np.float32)
+
+
+def _draw_frustum_wireframe(
+    draw: ImageDraw.ImageDraw,
+    points_xy: list[tuple[int, int]],
+    *,
+    color: tuple[int, int, int],
+    width: int,
+) -> None:
+    if len(points_xy) != 5:
+        return
+    o, c0, c1, c2, c3 = points_xy
+    draw.line([o, c0], fill=color, width=width)
+    draw.line([o, c1], fill=color, width=width)
+    draw.line([o, c2], fill=color, width=width)
+    draw.line([o, c3], fill=color, width=width)
+    draw.line([c0, c1], fill=color, width=width)
+    draw.line([c1, c2], fill=color, width=width)
+    draw.line([c2, c3], fill=color, width=width)
+    draw.line([c3, c0], fill=color, width=width)
+
+
 def _project_world_points_screen(
-    camera,
+    camera: OrthographicCameras,
     world_xyz: np.ndarray,
     *,
     device: torch.device,
@@ -517,151 +517,6 @@ def _project_world_points_screen(
         points[None, ...], image_size=image_size
     )[0, :, :2]
     return screen_pts.detach().cpu().numpy()
-
-
-def _prepare_coordinate_overlay(
-    camera,
-    *,
-    device: torch.device,
-    img_w: int,
-    img_h: int,
-    look_at: np.ndarray,
-    view_half_extent_xy: list[float],
-) -> dict:
-    half_w = max(float(view_half_extent_xy[0]), 1e-4)
-    half_h = max(float(view_half_extent_xy[1]), 1e-4)
-
-    grid_radius_x = max(1, int(np.floor(half_w)))
-    grid_radius_z = max(1, int(np.floor(half_h)))
-    step_units = max(1, int(np.ceil(max(grid_radius_x, grid_radius_z) / 4)))
-
-    grid_world = []
-    for gx in range(-grid_radius_x, grid_radius_x + 1, step_units):
-        for gz in range(-grid_radius_z, grid_radius_z + 1, step_units):
-            grid_world.append(
-                [look_at[0] + gx, look_at[1], look_at[2] + gz]
-            )
-
-    grid_screen = _project_world_points_screen(
-        camera,
-        np.asarray(grid_world, dtype=np.float32),
-        device=device,
-        img_w=img_w,
-        img_h=img_h,
-    )
-    grid_points_px = []
-    for x, y in grid_screen:
-        xi = int(round(float(x)))
-        yi = int(round(float(y)))
-        if 0 <= xi < img_w and 0 <= yi < img_h:
-            grid_points_px.append((xi, yi))
-
-    axis_len = max(0.8, min(1.6, 0.25 * min(half_w, half_h)))
-    axes_world = np.asarray(
-        [
-            [look_at[0], look_at[1], look_at[2]],  # origin
-            [look_at[0] + axis_len, look_at[1], look_at[2]],  # +X
-            [look_at[0], look_at[1], look_at[2] + axis_len],  # +Z
-        ],
-        dtype=np.float32,
-    )
-    axes_screen = _project_world_points_screen(
-        camera,
-        axes_world,
-        device=device,
-        img_w=img_w,
-        img_h=img_h,
-    )
-    axes_px = [tuple(int(round(v)) for v in p) for p in axes_screen]
-
-    return {
-        "grid_points_px": grid_points_px,
-        "origin_px": axes_px[0],
-        "x_axis_end_px": axes_px[1],
-        "z_axis_end_px": axes_px[2],
-    }
-
-
-def _draw_coordinate_overlay(
-    draw: ImageDraw.ImageDraw,
-    img_h: int,
-):
-
-    # Keep labels in a stable bottom-left legend area instead of scene interior.
-    legend_origin = (18, max(18, img_h - 22))
-    legend_x_end = (legend_origin[0] + 30, legend_origin[1])
-    legend_z_end = (legend_origin[0], legend_origin[1] - 30)
-    _draw_arrow(draw, legend_origin, legend_x_end,
-                color=(255, 64, 64), width=3, head_len=8.0)
-    _draw_arrow(draw, legend_origin, legend_z_end,
-                color=(64, 255, 64), width=3, head_len=8.0)
-    draw.ellipse(
-        [
-            legend_origin[0] - 3,
-            legend_origin[1] - 3,
-            legend_origin[0] + 3,
-            legend_origin[1] + 3,
-        ],
-        fill=(64, 64, 255),
-    )
-    draw.text((legend_x_end[0] + 4, legend_x_end[1] - 10),
-              "X", fill=(255, 64, 64))
-    draw.text((legend_z_end[0] + 4, legend_z_end[1] - 10),
-              "Z", fill=(64, 255, 64))
-    draw.text((legend_origin[0] + 6, legend_origin[1] + 2),
-              "(0,0)", fill=(255, 200, 200))
-
-
-def _estimate_fg_orientation_world(
-    points: torch.Tensor,
-    normals: torch.Tensor | None = None,
-    prev_dir_xz: np.ndarray | None = None,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
-    if points is None or points.numel() == 0 or points.shape[0] < 3:
-        return None, None
-
-    pts = points.detach().cpu().numpy()
-    direction_xz = None
-
-    # Prefer normals when available: use dominant horizontal normal direction.
-    if normals is not None and normals.numel() > 0 and normals.shape[-1] >= 3:
-        nrm = normals.detach().cpu().numpy()
-        nrm = np.asarray(nrm, dtype=np.float64).reshape(-1, 3)
-        nrm = nrm[np.isfinite(nrm).all(axis=1)]
-        if nrm.shape[0] > 0:
-            xz_n = nrm[:, [0, 2]]
-            mag = np.linalg.norm(xz_n, axis=1)
-            valid = mag > 1e-6
-            if np.any(valid):
-                xz_n = xz_n[valid] / mag[valid][:, None]
-                mean_n = xz_n.mean(axis=0)
-                mean_norm = np.linalg.norm(mean_n)
-                if mean_norm > 0.1:
-                    direction_xz = mean_n / mean_norm
-
-    # Fallback: principal axis from point distribution in XZ plane.
-    if direction_xz is None:
-        xz = pts[:, [0, 2]]
-        center_xz = xz.mean(axis=0)
-        centered = xz - center_xz[None, :]
-        cov = (centered.T @ centered) / max(centered.shape[0] - 1, 1)
-        evals, evecs = np.linalg.eigh(cov)
-        direction_xz = evecs[:, int(np.argmax(evals))]
-        norm = np.linalg.norm(direction_xz)
-        if norm < 1e-8:
-            return None, None
-        direction_xz = direction_xz / norm
-
-    if prev_dir_xz is not None and np.dot(direction_xz, prev_dir_xz) < 0:
-        direction_xz = -direction_xz
-    elif prev_dir_xz is None and direction_xz[0] < 0:
-        direction_xz = -direction_xz
-
-    centroid_world = pts.mean(axis=0)
-    direction_world = np.array(
-        [direction_xz[0], 0.0, direction_xz[1]], dtype=np.float32
-    )
-    return centroid_world.astype(np.float32), direction_world
 
 
 def _create_video_from_frames(frame_pattern: str, output_video: Path, fps: int = 25) -> None:
@@ -682,6 +537,14 @@ def _create_video_from_frames(frame_pattern: str, output_video: Path, fps: int =
     if result.returncode != 0:
         raise RuntimeError(
             f"ffmpeg failed ({output_video.name}): {result.stderr}")
+
+
+def _trajectory_dict_from_points(points_xy: list[tuple[int, int] | None]) -> dict:
+    traj = {}
+    for idx, pt in enumerate(points_xy):
+        key = f"t_{idx}"
+        traj[key] = {"position": list(pt)} if pt is not None else {"position": None}
+    return traj
 
 
 def main():
@@ -717,11 +580,6 @@ def main():
         default=1,
         help="Margin multiplier for orthographic view extents",
     )
-    parser.add_argument(
-        "--advanced",
-        action="store_true",
-        help="Enable advanced overlays (coordinate points/axes and orientation arrows)",
-    )
     parser.add_argument("--output_dir", type=str, default=None)
 
     args = parser.parse_args()
@@ -738,6 +596,13 @@ def main():
     source_poses = load_tum_poses(traj_path)
     if not source_poses:
         raise ValueError(f"Trajectory file is empty or invalid: {traj_path}")
+    intr_path = root_dir / "pred_intrinsics.txt"
+    if not intr_path.exists():
+        raise FileNotFoundError(f"Missing intrinsics file: {intr_path}")
+    source_intrinsics = load_intrinsics(intr_path)
+    if not source_intrinsics:
+        raise ValueError(f"Intrinsics file is empty or invalid: {intr_path}")
+    print(f"Loaded {len(source_intrinsics)} intrinsics from {intr_path}")
 
     fg_files = _list_frame_plys(fg_dir) if fg_dir and fg_dir.is_dir() else []
     bg_files = _list_frame_plys(bg_dir) if bg_dir and bg_dir.is_dir() else []
@@ -791,16 +656,6 @@ def main():
         camera_positions_world=src_cam_positions_np,
     )
 
-    # Local camera: tight fit to camera trajectory only (used only for local camera motion overlay exports).
-    local_camera, local_camera_params = _make_local_orthographic_camera(
-        topdown_pose=topdown_pose,
-        img_w=img_w,
-        img_h=img_h,
-        camera_positions_world=src_cam_positions_np,
-        margin=args.ortho_margin,
-        device=device,
-    )
-
     raster_settings = PointsRasterizationSettings(
         image_size=(img_h, img_w),
         bin_size=0,
@@ -827,25 +682,9 @@ def main():
     bbox_dir.mkdir(parents=True, exist_ok=True)
     motion_dir.mkdir(parents=True, exist_ok=True)
 
-    # Local camera trajectory-only exports
-    camera_motion_dir = output_dir / "camera_motion_overlay"
-    camera_motion_dir.mkdir(parents=True, exist_ok=True)
-
     io = IO()
     centers = []
     per_frame = []
-    prev_orient_dir_xz = None
-
-    advanced_coord_overlay = None
-    if args.advanced:
-        advanced_coord_overlay = _prepare_coordinate_overlay(
-            camera,
-            device=device,
-            img_w=img_w,
-            img_h=img_h,
-            look_at=look_at,
-            view_half_extent_xy=camera_params["view_half_extent_xy"],
-        )
 
     # Always calculate source camera trajectory in screen coordinates
     src_cam_positions = np.array([p.get_translation()
@@ -859,11 +698,7 @@ def main():
     src_traj_screen = [(int(round(x.item())), int(round(y.item())))
                        for x, y in src_screen_pts]
 
-    src_screen_pts_local = local_camera.transform_points_screen(src_cam_positions[None, ...], image_size=image_size)[
-        0, :, :2
-    ]
-    src_traj_screen_local = [(int(round(x.item())), int(
-        round(y.item()))) for x, y in src_screen_pts_local]
+    frustum_depth_world = 0.08 * max(camera_params["view_half_extent_xy"])
 
     for idx in range(n_frames):
         print(
@@ -877,7 +712,7 @@ def main():
             context_paths = [all_files[idx]] if idx < len(all_files) else []
 
         fg_path = fg_files[idx] if idx < len(fg_files) else None
-        fg_points, _, fg_normals = _load_points_and_features_and_normals(
+        fg_points, _, _ = _load_points_and_features_and_normals(
             fg_path, io=io, device=device
         )
 
@@ -928,58 +763,6 @@ def main():
                 fill=(255, 255, 0),
             )
 
-        orientation_arrow_xy = None
-        if args.advanced:
-            if advanced_coord_overlay is not None:
-                _draw_coordinate_overlay(
-                    bbox_draw,
-                    img_h=img_h,
-                )
-
-            orient_center_w, orient_dir_w = _estimate_fg_orientation_world(
-                fg_points,
-                normals=fg_normals,
-                prev_dir_xz=prev_orient_dir_xz,
-            )
-            if orient_center_w is not None and orient_dir_w is not None:
-                prev_orient_dir_xz = orient_dir_w[[0, 2]]
-                orient_len = 0.15 * max(camera_params["view_half_extent_xy"])
-                orient_world = np.stack(
-                    [
-                        orient_center_w,
-                        orient_center_w + orient_len * orient_dir_w,
-                    ],
-                    axis=0,
-                )
-                orient_screen = _project_world_points_screen(
-                    camera,
-                    orient_world,
-                    device=device,
-                    img_w=img_w,
-                    img_h=img_h,
-                )
-                sxy = (
-                    int(round(float(orient_screen[0, 0]))),
-                    int(round(float(orient_screen[0, 1]))),
-                )
-                exy = (
-                    int(round(float(orient_screen[1, 0]))),
-                    int(round(float(orient_screen[1, 1]))),
-                )
-                if (
-                    0 <= sxy[0] < img_w
-                    and 0 <= sxy[1] < img_h
-                    and 0 <= exy[0] < img_w
-                    and 0 <= exy[1] < img_h
-                ):
-                    _draw_arrow(
-                        bbox_draw,
-                        sxy,
-                        exy,
-                        color=(0, 255, 255),
-                        width=4,
-                    )
-                    orientation_arrow_xy = [list(sxy), list(exy)]
         bbox_img.save(bbox_dir / f"bbox-overlay_{idx:04d}.png")
 
         motion_img = bbox_img.copy()
@@ -1003,69 +786,105 @@ def main():
                 width=4
             )
 
-        # Draw the source camera trajectory as a polyline with color gradient and an arrowhead, like the motion center trajectory
-        if src_traj_screen and len(src_traj_screen) >= 2:
-            n_src = min(idx + 1, len(src_traj_screen))
-            if n_src >= 2:
-                for i in range(n_src - 1):
-                    t = i / max(1, n_src - 2) if n_src > 2 else 0
-                    color = src_colormap_color(t)
-                    motion_draw.line(
-                        [src_traj_screen[i], src_traj_screen[i + 1]], fill=color, width=3)
+        if src_traj_screen:
+            cam_idx = min(idx, len(src_traj_screen) - 1)
+            cam_t = cam_idx / max(1, len(src_traj_screen) - 1) if len(src_traj_screen) > 1 else 0.0
+            cam_color = colormap_color(cam_t)
+            curr_pose = source_poses[cam_idx]
+            curr_intr = (
+                source_intrinsics[cam_idx]
+                if cam_idx < len(source_intrinsics)
+                else source_intrinsics[-1]
+            )
+            frustum_world = _build_camera_frustum_world_points(
+                curr_pose,
+                curr_intr,
+                depth_scale=frustum_depth_world,
+            )
+            frustum_screen = _project_world_points_screen(
+                camera,
+                frustum_world,
+                device=device,
+                img_w=img_w,
+                img_h=img_h,
+            )
+            frustum_px = [
+                (int(round(float(x))), int(round(float(y))))
+                for x, y in frustum_screen
+            ]
+            _draw_frustum_wireframe(
+                motion_draw,
+                frustum_px,
+                color=cam_color,
+                width=2,
+            )
 
         motion_img.save(motion_dir / f"motion-overlay_{idx:04d}.png")
-
-        # Local: camera trajectory only, on black background, saved with camera-specific naming.
-        local_cam_img = Image.new("RGB", (img_w, img_h), color=(0, 0, 0))
-        local_cam_draw = ImageDraw.Draw(local_cam_img)
-        if src_traj_screen_local and len(src_traj_screen_local) >= 2:
-            n_src = min(idx + 1, len(src_traj_screen_local))
-            if n_src >= 2:
-                for i in range(n_src - 1):
-                    t = i / max(1, n_src - 2) if n_src > 2 else 0
-                    color = src_colormap_color(t)
-                    local_cam_draw.line(
-                        [src_traj_screen_local[i], src_traj_screen_local[i + 1]],
-                        fill=color,
-                        width=3,
-                    )
-                _draw_arrow(
-                    local_cam_draw,
-                    src_traj_screen_local[n_src - 2],
-                    src_traj_screen_local[n_src - 1],
-                    color=src_colormap_color(1.0),
-                    width=4,
-                )
-        local_cam_img.save(camera_motion_dir /
-                           f"camera-motion-overlay_local_{idx:04d}.png")
 
         frame_info = {
             "frame_index": idx,
             "bbox_xyxy": list(bbox) if bbox is not None else None,
             "center_xy": list(center) if center is not None else None,
-            "orientation_arrow_xy": orientation_arrow_xy,
         }
         per_frame.append(frame_info)
 
     print(f"\nSaved semantic renders to {output_dir}")
 
+    moving_object_centers = [
+        tuple(int(v) for v in frame["center_xy"]) if frame["center_xy"] is not None else None
+        for frame in per_frame
+    ]
+    moving_object_trajectory = _trajectory_dict_from_points(moving_object_centers)
+    capture_camera_trajectory = _trajectory_dict_from_points(src_traj_screen)
+    topdown_camera_pixels = {
+        "position": [
+            int(round(camera_params["principal_point_xy"][0])),
+            int(round(camera_params["principal_point_xy"][1])),
+        ]
+    }
+
+    capture_camera_json = {
+        "image_size": [img_h, img_w],
+        "camera_trajectory_pixels": capture_camera_trajectory,
+    }
+    topdown_camera_json = {
+        "image_size": [img_h, img_w],
+        "topdown_camera_pixel": topdown_camera_pixels,
+        "orthographic_params": camera_params,
+    }
+    moving_bbox_json = {
+        "image_size": [img_h, img_w],
+        "foreground_bbox_pixels": {
+            f"t_{frame['frame_index']}": {
+                "bbox_xyxy": frame["bbox_xyxy"],
+                "center_xy": frame["center_xy"],
+            }
+            for frame in per_frame
+        },
+    }
+
     semantic_meta = {
         "projection_type": "orthographic",
         "image_size": [img_h, img_w],
         "camera_height": args.height,
-        "camera_to_world_4x4": topdown_pose.numpy().tolist(),
-        "orthographic_params": camera_params,
-        "orthographic_params_local": local_camera_params,
-        "camera_trajectory_pixels": [list(p) for p in src_traj_screen],
-        "camera_trajectory_pixels_local": [list(p) for p in src_traj_screen_local],
-        "advanced_enabled": bool(args.advanced),
-        "frames": per_frame,
+        "orthographic_camera_to_world_4x4": topdown_pose.numpy().tolist(),
+        "orthographic_cam_parameters": camera_params,
+        "capture_camera_trajectory_pixels": [list(p) for p in src_traj_screen],
+        # "foreground_motion_path_pixels": moving_object_trajectory,
+        "per_frame_foreground_metadata": per_frame,
     }
 
     meta_path = output_dir / "semantic_topdown_metadata.json"
     with open(meta_path, "w") as f:
         json.dump(semantic_meta, f, indent=2)
     print(f"Saved metadata to {meta_path}")
+
+    with open(output_dir / "capture_cameras_pixels.json", "w") as f:
+        json.dump(capture_camera_json, f, indent=2)
+    with open(output_dir / "topdown_camera_pixels.json", "w") as f:
+        json.dump(topdown_camera_json, f, indent=2)
+    with open(output_dir / "moving_bbox_pixels.json", "w") as f:
+        json.dump(moving_bbox_json, f, indent=2)
 
     video_dir = output_dir / "vis-videos"
     video_dir.mkdir(parents=True, exist_ok=True)
@@ -1083,12 +902,6 @@ def main():
         video_dir / "motion_overlay.mp4",
     )
     print(f"Saved videos to {video_dir}")
-
-    _create_video_from_frames(
-        str(camera_motion_dir / "camera-motion-overlay_local_%04d.png"),
-        video_dir / "camera_motion_overlay_local.mp4",
-    )
-    print(f"Saved local camera motion video to {video_dir}")
 
     temp_dir = output_dir / ".temp"
     if temp_dir.exists():
