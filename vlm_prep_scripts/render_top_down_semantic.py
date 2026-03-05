@@ -209,7 +209,7 @@ def _collect_scene_bounds_in_view(scene_paths: list[Path], topdown_pose: Pose) -
     io_cpu = IO()
 
     pytorch3d_c2w_pose = topdown_pose.change_camera_coordinate_convention(
-        new_camera_coordinate_convention=CameraCoordinateConvention.PYTORCH_3D
+        new_camera_coordinate_convention=CameraCoordinateConvention.PYTORCH_3D, inplace=False
     )
     r = np.asarray(pytorch3d_c2w_pose.get_rotation_matrix(), dtype=np.float64)
     pytorch3d_w2c_pose = pytorch3d_c2w_pose.change_pose_type(
@@ -256,7 +256,7 @@ def _collect_xyz_bounds_in_view(
         return 1.0, 1.0
 
     pytorch3d_c2w_pose = topdown_pose.change_camera_coordinate_convention(
-        new_camera_coordinate_convention=CameraCoordinateConvention.PYTORCH_3D
+        new_camera_coordinate_convention=CameraCoordinateConvention.PYTORCH_3D, inplace=False
     )
     r = pytorch3d_c2w_pose.get_rotation_matrix()
     pytorch3d_w2c_pose = pytorch3d_c2w_pose.change_pose_type(
@@ -288,7 +288,7 @@ def _make_orthographic_camera(
     camera_positions_world: np.ndarray | None = None,
 ):
     pytorch3d_c2w_pose = topdown_pose.change_camera_coordinate_convention(
-        new_camera_coordinate_convention=CameraCoordinateConvention.PYTORCH_3D
+        new_camera_coordinate_convention=CameraCoordinateConvention.PYTORCH_3D, inplace=False
     )
     r = pytorch3d_c2w_pose.get_rotation_matrix()
     pytorch3d_w2c_pose = pytorch3d_c2w_pose.change_pose_type(
