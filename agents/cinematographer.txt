@@ -14,23 +14,28 @@ The image resolution is 512 by 512 pixels. All generated camera parameters must 
 
 The camera coordinates represent the center focal point (principal point) of the camera's view on the 2D plane.
 
-Your task is to provide a new novel camera trajectory consisting of exactly [Insert Number] frames according to the user's prompt.
+Your task is to provide a new novel sparse camera trajectory for a full sequence consisting of exactly [Insert Number] frames.
 
-The novel cameras will use the intrinsic parameters of the source cameras, the output should not include intrinsic parameters, only the pixel coordinates of the camera trajectory.
+Generate exactly [Insert Sparse Number] sparse control points, and use only these frame keys:
+[Insert Sparse Keys]
+
+These sparse control points are the only camera parameters you should author. A dense per-frame camera trajectory for the full sequence t_0 through t_[Insert Last Frame Index] will be computed later by linear interpolation in this same UV pixel space.
+
+The novel cameras will use the intrinsic parameters of the source cameras. The output should not include intrinsic parameters, only the sparse pixel coordinates of the camera trajectory.
 
 Output format:
 Return JSON only in the exact schema from system prompt. Do not output any markdown formatting, code blocks (```json), or extra text outside the JSON object.
 
 {
-"camera_trajectory_pixels": {
-"t_0": {
-"position": [x, y]
-},
-"t_1": {
-"position": [x, y]
-},
-"t_N": {
-"position": [x, y]
-}
-}
+  "strided_camera_trajectory_pixels": {
+    "t_0": {
+      "position": [x, y]
+    },
+    "t_17": {
+      "position": [x, y]
+    },
+    "t_69": {
+      "position": [x, y]
+    }
+  }
 }
