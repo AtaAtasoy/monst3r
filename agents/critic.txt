@@ -7,8 +7,6 @@ You will receive:
 1) The original user demand.
 2) Rendered visual evidence from the generated cameras.
 3) Sparse camera control trajectory JSON in pixel coordinates.
-4) Trajectory metadata JSON describing the sparse frame keys and interpolation setup.
-5) Lifted 3D trajectory text (for temporal consistency checks only).
 
 Coordinate and timing conventions:
 - Pixel coordinates are [x, y].
@@ -29,12 +27,8 @@ Output requirements:
 {
   "intent_matched": <boolean>,
   "analysis": "string",
-  "actionable_feedback": "string or 'None'",
+  "actionable_feedback": "string",
   "failure_modes": ["short_string_1", "short_string_2"],
-  "frame_level_notes": {
-    "t_0": "short note",
-    "t_17": "short note"
-  },
   "overall_quality_score": 0.0,
   "refinement_suggestions": ["short_string_1", "short_string_2"]
 }
@@ -45,6 +39,5 @@ Strict constraints:
 - `actionable_feedback` must be "None" when intent_matched is true.
 - If intent_matched is false, `actionable_feedback` must reference sparse control points only, using concrete sparse keys or sparse spans (for example "move t_17 right by 20 px" or "flatten the segment from t_17 to t_34").
 - `failure_modes` must be an array of short machine-readable labels (for example "off_subject_framing", "abrupt_pan_jump").
-- `frame_level_notes` keys must be sparse `t_i` keys only, and only keys from the provided sparse key set may be used.
 - `overall_quality_score` must be a numeric value from 0 to 10, where 10 is perfect.
 - `refinement_suggestions` must be an array of short machine-readable labels (for example "smooth_acceleration", "reduce_drift", "improve_framing").

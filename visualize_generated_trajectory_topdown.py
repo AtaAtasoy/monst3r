@@ -2,6 +2,7 @@ import argparse
 import json
 import subprocess
 from pathlib import Path
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -40,6 +41,171 @@ def load_tum_traj(path: Path) -> list[Pose]:
     if not poses:
         raise ValueError(f"No valid poses found in {path}")
     return poses
+
+
+def load_npz_traj(path: Path) -> list[Pose]:
+    payload = np.load(path)
+    if "data" not in payload.files:
+        raise ValueError(f"Missing `data` in NPZ file: {path}")
+    data = np.asarray(payload["data"], dtype=np.float64)
+    inds = np.asarray(payload["inds"], dtype=np.int64) if "inds" in payload.files else np.arange(len(data), dtype=np.int64)
+
+    if data.ndim != 3 or data.shape[1:] != (4, 4):
+        raise ValueError(
+            f"Expected data shape (N, 4, 4) in {path}, got {data.shape}"
+        )
+
+    if len(inds) != len(data):
+        raise ValueError(f"Mismatch: len(inds)={len(inds)} does not match len(data)={len(data)}")
+
+    sorted_pairs = sorted(
+        zip(inds.tolist(), data.tolist()),
+        key=lambda x: int(x[0]),
+    )
+    poses = []
+    for _, mat in sorted_pairs:
+        pose = Pose(
+            np.asarray(mat, dtype=np.float64),
+            pose_type=PoseType.CAM_2_WORLD,
+            camera_coordinate_convention=CameraCoordinateConvention.OPEN_CV,
+        )
+        poses.append(pose)
+    if not poses:
+        raise ValueError(f"No valid poses found in {path}")
+    return poses
+
+
+def load_npz_matrix4x4(path: Path) -> Tuple[list[np.ndarray], list[int]]:
+    payload = np.load(path)
+    if "data" not in payload.files:
+        raise ValueError(f"Missing `data` in NPZ file: {path}")
+    data = np.asarray(payload["data"], dtype=np.float64)
+    inds = np.asarray(payload["inds"], dtype=np.int64) if "inds" in payload.files else np.arange(len(data), dtype=np.int64)
+
+    if data.ndim != 3 or data.shape[1:] != (4, 4):
+        raise ValueError(f"Expected data shape (N, 4, 4) in {path}, got {data.shape}")
+    if len(inds) != len(data):
+        raise ValueError(f"Mismatch: len(inds)={len(inds)} does not match len(data)={len(data)} in {path}")
+
+    entries = sorted(zip(inds.tolist(), [np.asarray(m, dtype=np.float64) for m in data]))
+    sorted_data = [m for _, m in entries]
+    sorted_inds = [int(i) for i, _ in entries]
+    return sorted_data, sorted_inds
+
+
+def load_npz_intrinsics(path: Path) -> Tuple[list[np.ndarray], list[int]]:
+    payload = np.load(path)
+    if "data" not in payload.files:
+        raise ValueError(f"Missing `data` in intrinsics NPZ file: {path}")
+    data = np.asarray(payload["data"], dtype=np.float64)
+    inds = np.asarray(payload["inds"], dtype=np.int64) if "inds" in payload.files else np.arange(len(data), dtype=np.int64)
+
+    if data.ndim != 2 or data.shape[1] != 4:
+        if data.ndim == 3 and data.shape[1:] == (3, 3):
+            entries = sorted(zip(inds.tolist(), [np.asarray(m, dtype=np.float64) for m in data]))
+            sorted_data = [m for _, m in entries]
+            sorted_inds = [int(i) for i, _ in entries]
+            return sorted_data, sorted_inds
+        raise ValueError(f"Expected intrinsics data shape (N, 4) or (N, 3, 3) in {path}, got {data.shape}")
+
+    if len(inds) != len(data):
+        raise ValueError(f"Mismatch: len(inds)={len(inds)} does not match len(data)={len(data)} in {path}")
+
+    entries = sorted(zip(inds.tolist(), [np.asarray(v, dtype=np.float64) for v in data]))
+    sorted_data = [v for _, v in entries]
+    sorted_inds = [int(i) for i, _ in entries]
+    return sorted_data, sorted_inds
+
+
+def load_gen3c_intrinsics(data_seq: list[np.ndarray]) -> list[Intrinsics]:
+    intrinsics = []
+    for v in data_seq:
+        arr = np.asarray(v, dtype=np.float64).reshape(-1)
+        if arr.size == 4:
+            fx, fy, cx, cy = float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
+            mat = np.array(
+                [[fx, 0.0, cx, 0.0], [0.0, fy, cy, 0.0], [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0]],
+                dtype=np.float64,
+            )
+            # Convert to Intrinsics matrix form by keeping only upper-left 3x3 projection part.
+            intrinsics.append(Intrinsics(matrix_or_fx=mat[:3, :3].astype(np.float64)))
+        elif v.shape == (3, 3):
+            intrinsics.append(Intrinsics(matrix_or_fx=v.astype(np.float64)))
+        elif v.shape == (4, 4):
+            intrinsics.append(Intrinsics(matrix_or_fx=v[:3, :3].astype(np.float64)))
+        else:
+            raise ValueError(f"Unsupported intrinsics shape: {v.shape}")
+    return intrinsics
+
+
+def resolve_gen3c_file(root_dir: Path, subdir: str, explicit: Optional[str] = None) -> Path:
+    if explicit:
+        p = Path(explicit)
+        if not p.exists():
+            raise FileNotFoundError(f"Missing file: {p}")
+        return p
+    candidates = sorted((root_dir / subdir).glob("*.npz"))
+    if not candidates:
+        raise FileNotFoundError(f"No .npz files found in {root_dir / subdir}")
+    if len(candidates) > 1:
+        raise ValueError(f"Multiple candidates in {root_dir / subdir}: {[str(c) for c in candidates]}")
+    return candidates[0]
+
+
+def load_gen3c_output(
+    gen3c_output_dir: Path,
+    pose_npz: Optional[str] = None,
+    intrinsics_npz: Optional[str] = None,
+) -> Tuple[list[Pose], Optional[list[Intrinsics]]]:
+    pose_path = resolve_gen3c_file(gen3c_output_dir, "pose", pose_npz)
+    pose_data, pose_inds = load_npz_matrix4x4(pose_path)
+    pose_map = dict(zip(pose_inds, pose_data))
+
+    poses = [Pose(m, pose_type=PoseType.CAM_2_WORLD, camera_coordinate_convention=CameraCoordinateConvention.OPEN_CV) for m in pose_data]
+    intrinsics = None
+    if pose_npz is None and (gen3c_output_dir / "intrinsics").exists():
+        intr_path = resolve_gen3c_file(gen3c_output_dir, "intrinsics", intrinsics_npz)
+        intr_data, intr_inds = load_npz_intrinsics(intr_path)
+        intr_map = dict(zip(intr_inds, intr_data))
+        common_inds = [i for i in pose_map.keys() if i in intr_map]
+        if not common_inds:
+            if len(intr_inds) != len(pose_inds):
+                raise ValueError("No matching frame indices between pose.npz and intrinsics.npz")
+            common_inds = sorted(pose_inds)
+        common_inds = sorted(common_inds)
+        poses = [
+            Pose(
+                pose_map[i],
+                pose_type=PoseType.CAM_2_WORLD,
+                camera_coordinate_convention=CameraCoordinateConvention.OPEN_CV,
+            )
+            for i in common_inds
+        ]
+        intrinsics = load_gen3c_intrinsics([intr_map[i] for i in common_inds])
+    elif pose_npz and intrinsics_npz:
+        intr_data, intr_inds = load_npz_intrinsics(Path(intrinsics_npz))
+        intr_map = dict(zip(intr_inds, intr_data))
+        common_inds = [i for i in pose_map.keys() if i in intr_map]
+        if not common_inds:
+            raise ValueError("No matching frame indices between provided pose npz and intrinsics npz")
+        common_inds = sorted(common_inds)
+        poses = [
+            Pose(
+                pose_map[i],
+                pose_type=PoseType.CAM_2_WORLD,
+                camera_coordinate_convention=CameraCoordinateConvention.OPEN_CV,
+            )
+            for i in common_inds
+        ]
+        intrinsics = load_gen3c_intrinsics([intr_map[i] for i in common_inds])
+    elif not pose_npz and pose_path is not None:
+        # Keep pose-only mode so caller can request source comparison without frustums.
+        poses = [Pose(m, pose_type=PoseType.CAM_2_WORLD, camera_coordinate_convention=CameraCoordinateConvention.OPEN_CV) for m in pose_map.values()]
+    elif intrinsics_npz:
+        # Explicit intrinsics without auto pose path should not happen.
+        raise ValueError("Provide --gen3c-pose-npz together with --gen3c-intrinsics-npz when overriding pose path.")
+
+    return poses, intrinsics
 
 
 def load_intrinsics(path: Path) -> list[Intrinsics]:
@@ -200,14 +366,42 @@ def main() -> None:
         description="Visualize generated 3D camera trajectory from top-down orthographic view."
     )
     parser.add_argument("--semantic_metadata_json", type=str, required=True)
-    parser.add_argument("--generated_traj_txt", type=str, required=True, help="Lifted/generated TUM trajectory.")
+    parser.add_argument(
+        "--generated_traj_txt",
+        type=str,
+        default=None,
+        help="Lifted/generated TUM trajectory.",
+    )
+    parser.add_argument(
+        "--generated_traj_npz",
+        type=str,
+        default=None,
+        help="Lifted/generated NPZ trajectory (data, inds).",
+    )
+    parser.add_argument(
+        "--gen3c-output-dir",
+        type=str,
+        default=None,
+        help="Gen3C output directory containing pose/ and intrinsics/ .npz files.",
+    )
+    parser.add_argument(
+        "--gen3c-pose-npz",
+        type=str,
+        default=None,
+        help="Optional explicit pose NPZ inside gen3c-output (pose/*.npz).",
+    )
+    parser.add_argument(
+        "--gen3c-intrinsics-npz",
+        type=str,
+        default=None,
+        help="Optional explicit intrinsics NPZ inside gen3c-output (intrinsics/*.npz).",
+    )
     parser.add_argument("--source_traj_txt", type=str, default=None, help="Optional source trajectory for comparison.")
-    parser.add_argument("--intrinsics_path", type=str, default=None, help="Required when --draw_frustums is enabled.")
+    parser.add_argument("--intrinsics_path", type=str, default=None, help="Required to render frustum overlays.")
     parser.add_argument("--render_dir", type=str, default=None, help="Optional background frames folder containing top-down-render_XXXX.png.")
     parser.add_argument("--scene_ply_dir", type=str, default=None, help="Optional: render top-down background with PyTorch3D from frame_*.ply.")
     parser.add_argument("--output_dir", type=str, default="topdown_generated_trajectory_viz")
     parser.add_argument("--fps", type=int, default=25)
-    parser.add_argument("--draw_frustums", action="store_true")
     args = parser.parse_args()
 
     semantic = json.loads(Path(args.semantic_metadata_json).read_text(encoding="utf-8"))
@@ -228,14 +422,43 @@ def main() -> None:
         device=device,
     )
 
-    gen_poses = load_tum_traj(Path(args.generated_traj_txt))
+    has_tum = args.generated_traj_txt is not None
+    has_npz = args.generated_traj_npz is not None
+    has_gen3c_dir = args.gen3c_output_dir is not None
+    has_gen3c_pose = args.gen3c_pose_npz is not None or args.gen3c_intrinsics_npz is not None
+    if args.gen3c_pose_npz is None and args.gen3c_intrinsics_npz is not None:
+        raise ValueError("--gen3c-pose-npz is required when --gen3c-intrinsics-npz is provided.")
+    if has_tum and (has_npz or has_gen3c_dir):
+        raise ValueError("Specify only one trajectory input mode.")
+    if has_npz and (has_gen3c_dir or has_gen3c_pose):
+        raise ValueError("Specify only one trajectory input mode.")
+    if has_gen3c_dir and has_gen3c_pose:
+        raise ValueError("Specify --gen3c-output-dir or explicit --gen3c-pose-npz/--gen3c-intrinsics-npz, not both.")
+    if not (has_tum or has_npz or has_gen3c_dir or has_gen3c_pose):
+        raise ValueError("Specify one of --generated_traj_txt, --generated_traj_npz, --gen3c-output-dir, --gen3c-pose-npz, or --gen3c-intrinsics-npz.")
+    if has_tum:
+        gen_poses = load_tum_traj(Path(args.generated_traj_txt))
+        gen_intrinsics = None
+    elif has_npz:
+        gen_poses = load_npz_traj(Path(args.generated_traj_npz))
+        gen_intrinsics = None
+    else:
+        gen3c_dir = Path(args.gen3c_output_dir or Path(args.gen3c_pose_npz).parent)
+        gen_poses, gen_intrinsics = load_gen3c_output(
+            gen3c_output_dir=gen3c_dir,
+            pose_npz=args.gen3c_pose_npz,
+            intrinsics_npz=args.gen3c_intrinsics_npz,
+        )
+
     src_poses = load_tum_traj(Path(args.source_traj_txt)) if args.source_traj_txt else None
 
     intrinsics = None
-    if args.draw_frustums:
-        if not args.intrinsics_path:
-            raise ValueError("--intrinsics_path is required when --draw_frustums is enabled.")
+    if gen_intrinsics is not None:
+        intrinsics = gen_intrinsics
+    elif args.intrinsics_path:
         intrinsics = load_intrinsics(Path(args.intrinsics_path))
+    else:
+        raise ValueError("Missing intrinsics for frustum overlays.")
 
     scene_ply_files = None
     if args.scene_ply_dir:
@@ -271,8 +494,8 @@ def main() -> None:
             base = Image.new("RGB", (img_w, img_h), color=(0, 0, 0))
         draw = ImageDraw.Draw(base)
 
-        # Optional frustum overlays.
-        if args.draw_frustums and intrinsics is not None:
+        # Frustum overlays.
+        if intrinsics is not None:
             intr = intrinsics[min(i, len(intrinsics) - 1)]
             g_pose = gen_poses[i]
             g_frustum_world = build_frustum_world_points(g_pose, intr, depth_scale=depth_scale)

@@ -31,8 +31,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--user-demand", type=str, required=True)
     parser.add_argument("--strided-trajectory-json", type=Path, required=True)
-    parser.add_argument("--trajectory-metadata-json", type=Path, required=True)
-    parser.add_argument("--lifted-traj-tum", type=Path, required=True)
     parser.add_argument("--render-video", type=Path, required=True)
     parser.add_argument("--topdown-video", type=Path, default=None)
     parser.add_argument("--critic-out", type=Path, required=True)
@@ -40,6 +38,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inputs-dir", type=Path, required=True)
     parser.add_argument("--num-frames", type=int, default=None)
     return parser.parse_args()
+
+
+def extract_sparse_frame_keys(strided_trajectory_text: str) -> list[str]:
+    data = json.loads(strided_trajectory_text)
+    traj = data.get("strided_camera_trajectory_pixels")
+    if not isinstance(traj, dict):
+        raise RuntimeError(
+            "`strided_trajectory_json` must contain `strided_camera_trajectory_pixels` as an object"
+        )
+
+    indexed_keys: list[tuple[int, str]] = []
+    for key, value in traj.items():
+        if not isinstance(key, str) or not key.startswith("t_"):
+            continue
+        if not isinstance(value, dict):
+            continue
+        try:
+            frame_idx = int(key[2:])
+        except ValueError:
+            continue
+        indexed_keys.append((frame_idx, key))
+
+    if not indexed_keys:
+        raise RuntimeError(
+            "`strided_trajectory_json` must contain at least one sparse `t_i` entry"
+        )
+
+    indexed_keys.sort(key=lambda item: item[0])
+    return [key for _, key in indexed_keys]
 
 def validate_critic_output(
     data: dict[str, Any],
@@ -51,7 +78,6 @@ def validate_critic_output(
         "analysis",
         "actionable_feedback",
         "failure_modes",
-        "frame_level_notes",
         "overall_quality_score",
         "refinement_suggestions",
     ]
@@ -73,15 +99,6 @@ def validate_critic_output(
         raise RuntimeError("`refinement_suggestions` must be array")
     if not all(isinstance(item, str) for item in data["refinement_suggestions"]):
         raise RuntimeError("`refinement_suggestions` entries must be strings")
-    if not isinstance(data["frame_level_notes"], dict):
-        raise RuntimeError("`frame_level_notes` must be object")
-    for key, value in data["frame_level_notes"].items():
-        if not isinstance(key, str) or not key.startswith("t_"):
-            raise RuntimeError("`frame_level_notes` keys must be t_i format")
-        if key not in allowed_sparse_keys:
-            raise RuntimeError("`frame_level_notes` keys must come from sparse control keys")
-        if not isinstance(value, str):
-            raise RuntimeError("`frame_level_notes` values must be strings")
 
     actionable_feedback = data["actionable_feedback"]
     if data["intent_matched"] is True:
@@ -121,29 +138,17 @@ def main() -> None:
         raise FileNotFoundError(
             f"Missing strided trajectory json: {args.strided_trajectory_json}"
         )
-    if not args.trajectory_metadata_json.exists():
-        raise FileNotFoundError(
-            f"Missing trajectory metadata json: {args.trajectory_metadata_json}"
-        )
-    if not args.lifted_traj_tum.exists():
-        raise FileNotFoundError(f"Missing lifted traj txt: {args.lifted_traj_tum}")
     if not args.render_video.exists():
         raise FileNotFoundError(f"Missing render video: {args.render_video}")
 
     topdown_available = args.topdown_video is not None and args.topdown_video.exists()
 
-    metadata = json.loads(read_text(args.trajectory_metadata_json))
-    sparse_frame_keys = metadata.get("sparse_frame_keys")
-    if not isinstance(sparse_frame_keys, list) or not all(
-        isinstance(key, str) and key.startswith("t_") for key in sparse_frame_keys
-    ):
-        raise RuntimeError(
-            "`trajectory_metadata_json` must contain `sparse_frame_keys` as a list of t_i keys"
-        )
-    allowed_sparse_keys = set(cast(list[str], sparse_frame_keys))
+    strided_trajectory_text = read_text(args.strided_trajectory_json)
+    sparse_frame_keys = extract_sparse_frame_keys(strided_trajectory_text)
+    allowed_sparse_keys = set(sparse_frame_keys)
 
     if args.num_frames is None:
-        num_frames = int(metadata.get("num_frames", 0))
+        num_frames = max(int(key[2:]) for key in sparse_frame_keys) + 1
     else:
         num_frames = int(args.num_frames)
     if num_frames <= 0:
@@ -153,9 +158,6 @@ def main() -> None:
         num_frames=num_frames,
         sparse_frame_keys=cast(list[str], sparse_frame_keys),
     )
-    strided_trajectory_text = read_text(args.strided_trajectory_json)
-    metadata_text = read_text(args.trajectory_metadata_json)
-    lifted_tum_text = read_text(args.lifted_traj_tum)
     render_first, render_last = load_video_keyframes(args.render_video)
 
     topdown_first = None
@@ -174,8 +176,6 @@ def main() -> None:
         "Artifact Manifest:",
         f"- User Demand: {user_demand}",
         f"- Sparse 2D Trajectory JSON: {args.strided_trajectory_json.name}",
-        f"- Trajectory Metadata JSON: {args.trajectory_metadata_json.name}",
-        f"- Lifted 3D Trajectory TUM: {args.lifted_traj_tum.name}",
         f"- Rendered Video: {args.render_video.name} (keyframes: first,last)",
         (
             f"- Sparse Trajectory Topdown Video: {strided_viz_path.name}"
@@ -225,7 +225,7 @@ def main() -> None:
             "note": (
                 ""
                 if strided_viz_available
-                else "Sparse topdown video missing; critic will use sparse JSON + metadata."
+                else "Sparse topdown video missing; critic will use sparse JSON directly."
             ),
         },
         {
@@ -239,7 +239,7 @@ def main() -> None:
             "note": (
                 ""
                 if strided_viz_available
-                else "Sparse topdown video missing; critic will use sparse JSON + metadata."
+                else "Sparse topdown video missing; critic will use sparse JSON directly."
             ),
         },
     ]
@@ -321,10 +321,6 @@ def main() -> None:
         f"User Demand: {user_demand}",
         "Sparse 2D Camera Control Trajectory JSON:",
         strided_trajectory_text,
-        "Trajectory Metadata JSON:",
-        metadata_text,
-        "Lifted 3D Trajectory TUM:",
-        lifted_tum_text,
         "Return JSON only, using the exact schema specified in the system prompt.",
     ]
     (language_inputs_dir / "system_prompt.txt").write_text(system_prompt, encoding="utf-8")
@@ -333,12 +329,6 @@ def main() -> None:
     )
     (language_inputs_dir / "strided_camera_trajectory_pixels.json").write_text(
         strided_trajectory_text, encoding="utf-8"
-    )
-    (language_inputs_dir / "trajectory_metadata.json").write_text(
-        metadata_text, encoding="utf-8"
-    )
-    (language_inputs_dir / "lifted_pred_traj.txt").write_text(
-        lifted_tum_text, encoding="utf-8"
     )
     (language_inputs_dir / "user_text_blocks.json").write_text(
         json.dumps(user_text_blocks, indent=2, ensure_ascii=False),
@@ -353,6 +343,7 @@ def main() -> None:
                 "topdown_video_available": topdown_available,
                 "strided_topdown_video_available": strided_viz_available,
                 "sparse_frame_keys": sparse_frame_keys,
+                "num_frames": num_frames,
             },
             indent=2,
             ensure_ascii=False,
@@ -393,7 +384,7 @@ def main() -> None:
         user_content.append(
             {
                 "type": "text",
-                "text": "Sparse trajectory topdown video is unavailable. Evaluate the sparse path from the JSON and metadata directly.",
+                "text": "Sparse trajectory topdown video is unavailable. Evaluate the sparse path from the JSON directly.",
             }
         )
 
@@ -424,10 +415,6 @@ def main() -> None:
         [
             {"type": "text", "text": "Sparse 2D Camera Control Trajectory JSON:"},
             {"type": "text", "text": strided_trajectory_text},
-            {"type": "text", "text": "Trajectory Metadata JSON:"},
-            {"type": "text", "text": metadata_text},
-            {"type": "text", "text": "Lifted 3D Trajectory TUM:"},
-            {"type": "text", "text": lifted_tum_text},
             {
                 "type": "text",
                 "text": "Return JSON only, using the exact schema specified in the system prompt.",

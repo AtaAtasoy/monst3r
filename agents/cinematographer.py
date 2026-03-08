@@ -55,12 +55,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--strided-trajectory-out", type=Path, required=True)
     parser.add_argument("--dense-trajectory-out", type=Path, required=True)
-    parser.add_argument("--trajectory-metadata-out", type=Path, required=True)
     parser.add_argument("--reasoning-out", type=Path, required=True)
     parser.add_argument("--user-demand-out", type=Path, required=True)
     parser.add_argument("--critic-feedback-json", type=Path, default=None)
     parser.add_argument("--prior-strided-trajectory-json", type=Path, default=None)
-    parser.add_argument("--prior-trajectory-metadata-json", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -145,31 +143,6 @@ def interpolate_dense_trajectory(
     return dense_positions
 
 
-def build_trajectory_metadata(
-    *,
-    num_frames: int,
-    sparse_frame_divisor: int,
-    sparse_frame_indices: list[int],
-    img_w: int,
-    img_h: int,
-) -> dict[str, Any]:
-    return {
-        "coordinate_space": "pixel_xy",
-        "image_size": [img_h, img_w],
-        "bounds_xy": {
-            "x": [0.0, float(img_w - 1)],
-            "y": [0.0, float(img_h - 1)],
-        },
-        "num_frames": num_frames,
-        "sparse_frame_divisor": sparse_frame_divisor,
-        "sparse_frame_count": len(sparse_frame_indices),
-        "sparse_frame_indices": sparse_frame_indices,
-        "sparse_frame_keys": frame_keys_from_indices(sparse_frame_indices),
-        "interpolation_method": "linear_uv",
-        "dense_output_key": "camera_trajectory_pixels",
-        "strided_output_key": "strided_camera_trajectory_pixels",
-    }
-
 def main() -> None:
     args = parse_args()
     user_demand = args.user_demand.strip()
@@ -189,21 +162,11 @@ def main() -> None:
         raise FileNotFoundError(
             f"Missing prior strided trajectory json: {args.prior_strided_trajectory_json}"
         )
-    if (
-        args.prior_trajectory_metadata_json is not None
-        and not args.prior_trajectory_metadata_json.exists()
-    ):
-        raise FileNotFoundError(
-            "Missing prior trajectory metadata json: "
-            f"{args.prior_trajectory_metadata_json}"
-        )
-
     refinement_requested = any(
         path is not None
         for path in (
             args.critic_feedback_json,
             args.prior_strided_trajectory_json,
-            args.prior_trajectory_metadata_json,
         )
     )
     if refinement_requested and not all(
@@ -211,12 +174,11 @@ def main() -> None:
         for path in (
             args.critic_feedback_json,
             args.prior_strided_trajectory_json,
-            args.prior_trajectory_metadata_json,
         )
     ):
         raise ValueError(
-            "Refinement requires --critic-feedback-json, --prior-strided-trajectory-json, "
-            "and --prior-trajectory-metadata-json together."
+            "Refinement requires --critic-feedback-json and "
+            "--prior-strided-trajectory-json together."
         )
 
     sparse_frame_indices = compute_sparse_frame_indices(
@@ -241,16 +203,6 @@ def main() -> None:
     capture_cameras_data = json.loads(capture_cameras_json.read_text(encoding="utf-8"))
     moving_bbox_data = json.loads(moving_bbox_json.read_text(encoding="utf-8"))
     semantic_metadata = json.loads(semantic_metadata_json.read_text(encoding="utf-8"))
-
-    img_h, img_w = map(int, semantic_metadata["image_size"])
-    metadata_json = build_trajectory_metadata(
-        num_frames=args.num_frames,
-        sparse_frame_divisor=args.sparse_frame_divisor,
-        sparse_frame_indices=sparse_frame_indices,
-        img_w=img_w,
-        img_h=img_h,
-    )
-    metadata_text = json.dumps(metadata_json, indent=2, ensure_ascii=True)
 
     video_object, _ = load_video(
         str(
@@ -277,21 +229,14 @@ def main() -> None:
     refinement_block_text = ""
     critic_feedback_text = ""
     prior_strided_trajectory_text = ""
-    prior_trajectory_metadata_text = ""
     if refinement_requested:
         critic_data = json.loads(args.critic_feedback_json.read_text(encoding="utf-8"))
         prior_strided_data = json.loads(
             args.prior_strided_trajectory_json.read_text(encoding="utf-8")
         )
-        prior_metadata_data = json.loads(
-            args.prior_trajectory_metadata_json.read_text(encoding="utf-8")
-        )
         critic_feedback_text = json.dumps(critic_data, indent=2, ensure_ascii=True)
         prior_strided_trajectory_text = json.dumps(
             prior_strided_data, indent=2, ensure_ascii=True
-        )
-        prior_trajectory_metadata_text = json.dumps(
-            prior_metadata_data, indent=2, ensure_ascii=True
         )
 
         analysis = str(critic_data.get("analysis", ""))
@@ -319,7 +264,6 @@ def main() -> None:
             [
                 "- Critic Feedback (Previous Iteration): critic_result.json",
                 "- Prior Sparse Camera Trajectory (Previous Iteration): strided_camera_trajectory_pixels.json",
-                "- Prior Trajectory Metadata (Previous Iteration): trajectory_metadata.json",
             ]
         )
     artifact_manifest_text = "\n".join(artifact_manifest_lines)
@@ -351,8 +295,6 @@ def main() -> None:
         capture_cameras_text,
         "Foreground Motion Path (Pixel Coordinates) - moving_bbox_pixels.json:",
         moving_bbox_text,
-        "Current Trajectory Metadata Contract:",
-        metadata_text,
     ]
     if refinement_block_text:
         user_text_blocks.extend(
@@ -362,8 +304,6 @@ def main() -> None:
                 critic_feedback_text,
                 "Previous Iteration Sparse Trajectory JSON:",
                 prior_strided_trajectory_text,
-                "Previous Iteration Trajectory Metadata JSON:",
-                prior_trajectory_metadata_text,
             ]
         )
     user_text_blocks.append(
@@ -410,21 +350,6 @@ def main() -> None:
             visual_inputs_dir / str(record["file_name"]),
         )
 
-    visual_manifest = [
-        {
-            "order": int(record["order"]),
-            "file_name": str(record["file_name"]),
-            "role": str(record["role"]),
-            "source": str(record["source"]),
-            "frame_index": int(record["frame_index"]),
-        }
-        for record in visual_input_records
-    ]
-    (visual_inputs_dir / "visual_inputs_manifest.json").write_text(
-        json.dumps(visual_manifest, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
     (language_inputs_dir / "system_prompt.txt").write_text(system_prompt, encoding="utf-8")
     (language_inputs_dir / "artifact_manifest.txt").write_text(
         f"{artifact_manifest_text}\n", encoding="utf-8"
@@ -439,34 +364,12 @@ def main() -> None:
     (language_inputs_dir / "moving_bbox_pixels.json").write_text(
         moving_bbox_text, encoding="utf-8"
     )
-    (language_inputs_dir / "trajectory_metadata.json").write_text(
-        metadata_text, encoding="utf-8"
-    )
-    (language_inputs_dir / "request_config.json").write_text(
-        json.dumps(
-            {
-                "model": model_name,
-                "num_frames": args.num_frames,
-                "sparse_frame_divisor": args.sparse_frame_divisor,
-                "sparse_frame_indices": sparse_frame_indices,
-                "sparse_frame_keys": sparse_frame_keys,
-                "response_format": {"type": "json_object"},
-                "max_tokens": 4096 * 4,
-            },
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
     if refinement_block_text:
         (language_inputs_dir / "critic_feedback.json").write_text(
             critic_feedback_text, encoding="utf-8"
         )
         (language_inputs_dir / "prior_strided_trajectory.json").write_text(
             prior_strided_trajectory_text, encoding="utf-8"
-        )
-        (language_inputs_dir / "prior_trajectory_metadata.json").write_text(
-            prior_trajectory_metadata_text, encoding="utf-8"
         )
     print(f"Saved VLM inputs to: {vlm_inputs_dir}")
 
@@ -510,14 +413,6 @@ def main() -> None:
             "type": "text",
             "text": moving_bbox_text,
         },
-        {
-            "type": "text",
-            "text": "Current Trajectory Metadata Contract:",
-        },
-        {
-            "type": "text",
-            "text": metadata_text,
-        },
     ]
     if refinement_block_text:
         user_content.extend(
@@ -527,8 +422,6 @@ def main() -> None:
                 {"type": "text", "text": critic_feedback_text},
                 {"type": "text", "text": "Previous Iteration Sparse Trajectory JSON:"},
                 {"type": "text", "text": prior_strided_trajectory_text},
-                {"type": "text", "text": "Previous Iteration Trajectory Metadata JSON:"},
-                {"type": "text", "text": prior_trajectory_metadata_text},
             ]
         )
     user_content.append(
@@ -696,7 +589,6 @@ def main() -> None:
 
     args.strided_trajectory_out.parent.mkdir(parents=True, exist_ok=True)
     args.dense_trajectory_out.parent.mkdir(parents=True, exist_ok=True)
-    args.trajectory_metadata_out.parent.mkdir(parents=True, exist_ok=True)
     args.reasoning_out.parent.mkdir(parents=True, exist_ok=True)
     args.user_demand_out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -711,12 +603,6 @@ def main() -> None:
         encoding="utf-8",
     )
     print(f"Saved dense trajectory JSON to: {args.dense_trajectory_out}")
-
-    args.trajectory_metadata_out.write_text(
-        json.dumps(metadata_json, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    print(f"Saved trajectory metadata JSON to: {args.trajectory_metadata_out}")
     print(f"Saved strided trajectory topdown video to: {strided_viz_path}")
 
     args.reasoning_out.write_text(str(reasoning), encoding="utf-8")
