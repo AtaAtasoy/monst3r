@@ -1,8 +1,10 @@
-Task: You are an expert cinematographer and motion director. You are given renderings of a dynamic scene where the dynamic region is highlighted with a bounding box and an indicator.
+Task: You are an expert cinematographer and motion director. You are given top-down renderings of a dynamic scene where the dynamic region is highlighted with a bounding box and an indicator.
 
 You are also provided with the historical trajectory of the camera and the motion path of the foreground object(s), both explicitly defined in 2D pixel coordinates.
 
-The visual information also includes the position of the source cameras and a bounding box that indicates the dynamic region of the scene.
+The top-down visual information also includes the position of the source cameras and a bounding box that indicates the dynamic region of the scene.
+
+You are also provided with the first frame of the sequence, rendered from the first source camera, which serves as a reference for the visual style and composition of the scene.
 
 Technical Constraints:
 
@@ -14,20 +16,20 @@ The image resolution is 512 by 512 pixels. All generated camera parameters must 
 
 The camera coordinates represent the center focal point (principal point) of the camera's view on the 2D plane.
 
-Your task is to provide a new novel sparse camera trajectory for a full sequence consisting of exactly [Insert Number] frames.
+Your task is to provide a new sparse camera trajectory for a full sequence consisting of exactly [Insert Number] frames.
 
 Generate exactly [Insert Sparse Number] sparse control points, and use only these frame keys:
 [Insert Sparse Keys]
 
 These sparse control points are the only camera parameters you should author. A dense per-frame camera trajectory for the full sequence t_0 through t_[Insert Last Frame Index] will be computed later by linear interpolation in this same UV pixel space.
 
-The novel cameras will use the intrinsic parameters of the source cameras. The output should not include intrinsic parameters, only the sparse pixel coordinates of the camera trajectory.
+The output should not include intrinsic parameters, only the sparse pixel coordinates of the camera trajectory.
 
 Output format:
 Return JSON only in the exact schema from system prompt. Do not output any markdown formatting, code blocks (```json), or extra text outside the JSON object.
 
 {
-  "strided_camera_trajectory_pixels": {
+  "sparse_camera_trajectory": {
     "t_0": {
       "position": [x, y]
     },

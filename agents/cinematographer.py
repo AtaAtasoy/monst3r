@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -13,7 +14,12 @@ from transformers.video_utils import load_video
 
 from .strided_trajectory_visualization import visualize_strided_trajectory
 from .vlm_response_utils import extract_json_from_response, is_missing_response_content
-from .io import open_image_as_base64, image_to_base64, save_base64_png
+from .io import (
+    open_image_as_base64,
+    image_to_base64,
+    save_base64_png,
+    save_sampled_video_frames,
+)
 
 
 PROJECT_DIR = Path(str(os.environ.get("PROJECT_DIR")))
@@ -58,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reasoning-out", type=Path, required=True)
     parser.add_argument("--user-demand-out", type=Path, required=True)
     parser.add_argument("--critic-feedback-json", type=Path, default=None)
-    parser.add_argument("--prior-strided-trajectory-json", type=Path, default=None)
+    parser.add_argument("--prior-sparse-trajectory-json", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -76,6 +82,7 @@ def compute_sparse_frame_indices(num_frames: int, divisor: int) -> list[int]:
         if not indices or indices[-1] != index:
             indices.append(index)
 
+    # Ensure first and last frames are included
     if indices[0] != 0:
         indices.insert(0, 0)
     if indices[-1] != num_frames - 1:
@@ -156,29 +163,29 @@ def main() -> None:
     if args.critic_feedback_json is not None and not args.critic_feedback_json.exists():
         raise FileNotFoundError(f"Missing critic feedback json: {args.critic_feedback_json}")
     if (
-        args.prior_strided_trajectory_json is not None
-        and not args.prior_strided_trajectory_json.exists()
+        args.prior_sparse_trajectory_json is not None
+        and not args.prior_sparse_trajectory_json.exists()
     ):
         raise FileNotFoundError(
-            f"Missing prior strided trajectory json: {args.prior_strided_trajectory_json}"
+            f"Missing prior strided trajectory json: {args.prior_sparse_trajectory_json}"
         )
     refinement_requested = any(
         path is not None
         for path in (
             args.critic_feedback_json,
-            args.prior_strided_trajectory_json,
+            args.prior_sparse_trajectory_json,
         )
     )
-    if refinement_requested and not all(
-        path is not None
+    if refinement_requested and any(
+        path is None
         for path in (
             args.critic_feedback_json,
-            args.prior_strided_trajectory_json,
+            args.prior_sparse_trajectory_json,
         )
     ):
         raise ValueError(
             "Refinement requires --critic-feedback-json and "
-            "--prior-strided-trajectory-json together."
+            "--prior-sparse-trajectory-json together."
         )
 
     sparse_frame_indices = compute_sparse_frame_indices(
@@ -204,10 +211,14 @@ def main() -> None:
     moving_bbox_data = json.loads(moving_bbox_json.read_text(encoding="utf-8"))
     semantic_metadata = json.loads(semantic_metadata_json.read_text(encoding="utf-8"))
 
+    motion_overlay_video_path = (
+        scene_root
+        / "top-down-semantic-ortho-all-scene/vis-videos/motion_overlay.mp4"
+    )
+    video_sampling_fps = 2.0
     video_object, _ = load_video(
         str(
-            scene_root
-            / "top-down-semantic-ortho-all-camera_centroid/vis-videos/motion_overlay.mp4"
+            motion_overlay_video_path
         )  # ty:ignore[invalid-argument-type]
     )
 
@@ -215,34 +226,33 @@ def main() -> None:
     video_frames = video_object[[0, -1]]
     video_frames = [image_to_base64(frame) for frame in video_frames]
 
-    artifact_manifest_lines = [
-        "Artifact Manifest:",
-        f"- User Demand: {user_demand}",
-        "- Rendered Images: capture camera first frame, motion overlay start frame, motion overlay end frame",
-        "- Foreground Motion Path (Pixel Coordinates): moving_bbox_pixels.json",
-        "- Source Camera Positions: capture_cameras_pixels.json",
-        "- Extra Metadata: semantic_topdown_metadata.json",
-        f"- Sparse Control Frames Requested: {', '.join(sparse_frame_keys)}",
-        f"- Dense Full Sequence Length: {args.num_frames}",
-    ]
+    # artifact_manifest_lines = [
+    #     "Artifact Manifest:",
+    #     f"- User Demand: {user_demand}",
+    #     "- Rendered Images: capture camera first frame, motion overlay start frame, motion overlay end frame",
+    #     "- Foreground Motion Path (Pixel Coordinates): moving_bbox_pixels.json",
+    #     "- Source Camera Positions: capture_cameras_pixels.json",
+    #     f"- Sparse Control Frames Requested: {', '.join(sparse_frame_keys)}",
+    #     f"- Dense Full Sequence Length: {args.num_frames}",
+    # ]
 
     refinement_block_text = ""
     critic_feedback_text = ""
-    prior_strided_trajectory_text = ""
+    prior_sparse_trajectory_text = ""
+    #TODO: Analyze refinement request together with critic.py
     if refinement_requested:
         critic_data = json.loads(args.critic_feedback_json.read_text(encoding="utf-8"))
-        prior_strided_data = json.loads(
-            args.prior_strided_trajectory_json.read_text(encoding="utf-8")
+        prior_sparse_trajectory_data = json.loads(
+            args.prior_sparse_trajectory_json.read_text(encoding="utf-8")
         )
         critic_feedback_text = json.dumps(critic_data, indent=2, ensure_ascii=True)
-        prior_strided_trajectory_text = json.dumps(
-            prior_strided_data, indent=2, ensure_ascii=True
+        prior_sparse_trajectory_text = json.dumps(
+            prior_sparse_trajectory_data, indent=2, ensure_ascii=True
         )
 
         analysis = str(critic_data.get("analysis", ""))
         actionable_feedback = str(critic_data.get("actionable_feedback", ""))
         failure_modes = critic_data.get("failure_modes", [])
-        frame_level_notes = critic_data.get("frame_level_notes", {})
         overall_quality_score = critic_data.get("overall_quality_score", "")
         refinement_block_text = "\n".join(
             [
@@ -251,7 +261,6 @@ def main() -> None:
                 f"- Previous analysis: {analysis}",
                 f"- Previous actionable_feedback: {actionable_feedback}",
                 f"- Previous failure_modes: {json.dumps(failure_modes, ensure_ascii=True)}",
-                f"- Previous frame_level_notes: {json.dumps(frame_level_notes, ensure_ascii=True)}",
                 (
                     "- Previous sparse control trajectory is the editable representation. "
                     "The prior dense trajectory was derived from interpolation and should be "
@@ -260,55 +269,55 @@ def main() -> None:
                 "Improve the new sparse control trajectory using this feedback while still prioritizing the current user demand.",
             ]
         )
-        artifact_manifest_lines.extend(
-            [
-                "- Critic Feedback (Previous Iteration): critic_result.json",
-                "- Prior Sparse Camera Trajectory (Previous Iteration): strided_camera_trajectory_pixels.json",
-            ]
-        )
-    artifact_manifest_text = "\n".join(artifact_manifest_lines)
+    #     artifact_manifest_lines.extend(
+    #         [
+    #             "- Critic Feedback (Previous Iteration): critic_result.json",
+    #             "- Prior Sparse Camera Trajectory (Previous Iteration): sparse_camera_trajectory.json",
+    #         ]
+    #     )
+    # artifact_manifest_text = "\n".join(artifact_manifest_lines)
 
     capture_cameras_text = json.dumps(capture_cameras_data, indent=2, ensure_ascii=True)
     moving_bbox_text = json.dumps(moving_bbox_data, indent=2, ensure_ascii=True)
 
-    sparse_requirement_text = "\n".join(
-        [
-            "Sparse Control Point Requirements:",
-            f"- Generate exactly {len(sparse_frame_keys)} sparse control points.",
-            f"- Use only these frame keys: {', '.join(sparse_frame_keys)}",
-            (
-                f"- The full dense sequence has {args.num_frames} frames, but you must only "
-                "author the sparse control points listed above."
-            ),
-            "- Dense per-frame cameras will be computed later by linear interpolation in UV space.",
-        ]
-    )
+    # sparse_requirement_text = "\n".join(
+    #     [
+    #         "Sparse Control Point Requirements:",
+    #         f"- Generate exactly {len(sparse_frame_keys)} sparse control points.",
+    #         f"- Use only these frame keys: {', '.join(sparse_frame_keys)}",
+    #         (
+    #             f"- The full dense sequence has {args.num_frames} frames, but you must only "
+    #             "author the sparse control points listed above."
+    #         ),
+    #         "- Dense per-frame cameras will be computed later by linear interpolation in UV space.",
+    #     ]
+    # )
 
-    user_text_blocks = [
-        artifact_manifest_text,
-        f"User Demand: {user_demand}",
-        sparse_requirement_text,
-        "Rendered Image 1 (capture camera first frame):",
-        "Rendered Image 2 (motion overlay start frame):",
-        "Rendered Image 3 (motion overlay end frame):",
-        "Source Camera Positions (Pixel Coordinates) - capture_cameras_pixels.json:",
-        capture_cameras_text,
-        "Foreground Motion Path (Pixel Coordinates) - moving_bbox_pixels.json:",
-        moving_bbox_text,
-    ]
-    if refinement_block_text:
-        user_text_blocks.extend(
-            [
-                refinement_block_text,
-                "Previous Iteration Critic Feedback JSON:",
-                critic_feedback_text,
-                "Previous Iteration Sparse Trajectory JSON:",
-                prior_strided_trajectory_text,
-            ]
-        )
-    user_text_blocks.append(
-        "Return JSON only, using the exact schema specified in the system prompt."
-    )
+    # user_text_blocks = [
+    #     artifact_manifest_text,
+    #     f"User Demand: {user_demand}",
+    #     sparse_requirement_text,
+    #     "Rendered Image 1 (capture camera first frame):",
+    #     "Rendered Image 2 (motion overlay start frame):",
+    #     "Rendered Image 3 (motion overlay end frame):",
+    #     "Source Camera Positions (Pixel Coordinates) - capture_cameras_pixels.json:",
+    #     capture_cameras_text,
+    #     "Foreground Motion Path (Pixel Coordinates) - moving_bbox_pixels.json:",
+    #     moving_bbox_text,
+    # ]
+    # if refinement_block_text:
+    #     user_text_blocks.extend(
+    #         [
+    #             refinement_block_text,
+    #             "Previous Iteration Critic Feedback JSON:",
+    #             critic_feedback_text,
+    #             "Previous Iteration Sparse Trajectory JSON:",
+    #             prior_sparse_trajectory_text,
+    #         ]
+    #     )
+    # user_text_blocks.append(
+    #     "Return JSON only, using the exact schema specified in the system prompt."
+    # )
 
     vlm_dir = args.strided_trajectory_out.parent
     vlm_inputs_dir = vlm_dir / "inputs"
@@ -320,44 +329,70 @@ def main() -> None:
     visual_input_records: list[dict[str, int | str]] = [
         {
             "order": 0,
+            "file_type": "image",
             "file_name": "input_000__capture_camera__frame_0000.png",
             "role": "capture_camera_first_frame",
             "source": "renders_all/0000.png",
             "frame_index": 0,
             "image_base64": capture_camera_first_frame,
         },
+        # {
+        #     "order": 1,
+        #     "file_name": "input_001__motion_overlay__frame_0000.png",
+        #     "role": "motion_overlay_frame",
+        #     "source": "motion_overlay.mp4",
+        #     "frame_index": 0,
+        #     "image_base64": video_frames[0],
+        # },
+        # {
+        #     "order": 2,
+        #     "file_name": "input_002__motion_overlay__frame_last.png",
+        #     "role": "motion_overlay_frame",
+        #     "source": "motion_overlay.mp4",
+        #     "frame_index": -1,
+        #     "image_base64": video_frames[1],
+        # },
         {
             "order": 1,
-            "file_name": "input_001__motion_overlay__frame_0000.png",
-            "role": "motion_overlay_frame",
-            "source": "motion_overlay.mp4",
-            "frame_index": 0,
-            "image_base64": video_frames[0],
-        },
-        {
-            "order": 2,
-            "file_name": "input_002__motion_overlay__frame_last.png",
-            "role": "motion_overlay_frame",
-            "source": "motion_overlay.mp4",
-            "frame_index": -1,
-            "image_base64": video_frames[1],
-        },
+            "file_type": "video",
+            "file_name": "motion_overlay.mp4",
+            "role": "motion_overlay_video",
+            "source": "top-down-semantic-ortho-all-scene/vis-videos/motion_overlay.mp4",
+        }
     ]
 
     for record in visual_input_records:
-        save_base64_png(
-            str(record["image_base64"]),
-            visual_inputs_dir / str(record["file_name"]),
-        )
+        if record["file_type"] == "image":
+            save_base64_png(
+                str(record["image_base64"]),
+                visual_inputs_dir / str(record["file_name"]),
+            )
+        if record["file_type"] == "video":
+            video_path = visual_inputs_dir / record["file_name"]
+            if not video_path.exists():
+                source_video_path = scene_root / str(record["source"])
+                try:
+                    os.link(source_video_path, video_path)
+                except OSError:
+                    shutil.copyfile(source_video_path, video_path)
+
+    video_path = (visual_inputs_dir / "motion_overlay.mp4").resolve()
+    sampled_video_frames_dir = visual_inputs_dir / "motion_overlay__sampled_frames"
+    save_sampled_video_frames(
+        motion_overlay_video_path,
+        sampled_video_frames_dir,
+        fps=video_sampling_fps,
+        backend="opencv",
+    )
 
     (language_inputs_dir / "system_prompt.txt").write_text(system_prompt, encoding="utf-8")
-    (language_inputs_dir / "artifact_manifest.txt").write_text(
-        f"{artifact_manifest_text}\n", encoding="utf-8"
-    )
-    (language_inputs_dir / "user_text_blocks.json").write_text(
-        json.dumps(user_text_blocks, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    # (language_inputs_dir / "artifact_manifest.txt").write_text(
+    #     f"{artifact_manifest_text}\n", encoding="utf-8"
+    # )
+    # (language_inputs_dir / "user_text_blocks.json").write_text(
+    #     json.dumps(user_text_blocks, indent=2, ensure_ascii=False),
+    #     encoding="utf-8",
+    # )
     (language_inputs_dir / "capture_cameras_pixels.json").write_text(
         capture_cameras_text, encoding="utf-8"
     )
@@ -368,18 +403,19 @@ def main() -> None:
         (language_inputs_dir / "critic_feedback.json").write_text(
             critic_feedback_text, encoding="utf-8"
         )
-        (language_inputs_dir / "prior_strided_trajectory.json").write_text(
-            prior_strided_trajectory_text, encoding="utf-8"
+        (language_inputs_dir / "prior_sparse_trajectory.json").write_text(
+            prior_sparse_trajectory_text, encoding="utf-8"
         )
     print(f"Saved VLM inputs to: {vlm_inputs_dir}")
+    print(f"Saved sampled video frames to: {sampled_video_frames_dir}")
 
     user_content = [
-        {
-            "type": "text",
-            "text": artifact_manifest_text,
-        },
+        # {
+        #     "type": "text",
+        #     "text": artifact_manifest_text,
+        # },
         {"type": "text", "text": f"User Demand: {user_demand}"},
-        {"type": "text", "text": sparse_requirement_text},
+        # {"type": "text", "text": sparse_requirement_text},
         {"type": "text", "text": "Rendered Image 1 (capture camera first frame):"},
         {
             "type": "image_url",
@@ -387,16 +423,18 @@ def main() -> None:
                 "url": f"data:image/png;base64,{capture_camera_first_frame}"
             },
         },
-        {"type": "text", "text": "Rendered Image 2 (motion overlay start frame):"},
-        {
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{video_frames[0]}"},
-        },
-        {"type": "text", "text": "Rendered Image 3 (motion overlay end frame):"},
-        {
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{video_frames[1]}"},
-        },
+        # {"type": "text", "text": "Rendered Image 2 (motion overlay start frame):"},
+        # {
+        #     "type": "image_url",
+        #     "image_url": {"url": f"data:image/png;base64,{video_frames[0]}"},
+        # },
+        # {"type": "text", "text": "Rendered Image 3 (motion overlay end frame):"},
+        # {
+        #     "type": "image_url",
+        #     "image_url": {"url": f"data:image/png;base64,{video_frames[1]}"},
+        # },
+        {"type": "text", "text": "Motion Overlay Video, highlighting the foreground motion path and source camera positions:"},
+        {"type": "video_url", "video_url": {"url":  video_path.as_uri()}},
         {
             "type": "text",
             "text": "Source Camera Positions (Pixel Coordinates) - capture_cameras_pixels.json:",
@@ -421,15 +459,15 @@ def main() -> None:
                 {"type": "text", "text": "Previous Iteration Critic Feedback JSON:"},
                 {"type": "text", "text": critic_feedback_text},
                 {"type": "text", "text": "Previous Iteration Sparse Trajectory JSON:"},
-                {"type": "text", "text": prior_strided_trajectory_text},
+                {"type": "text", "text": prior_sparse_trajectory_text},
             ]
         )
-    user_content.append(
-        {
-            "type": "text",
-            "text": "Return JSON only, using the exact schema specified in the system prompt.",
-        }
-    )
+    # user_content.append(
+    #     {
+    #         "type": "text",
+    #         "text": "Return JSON only, using the exact schema specified in the system prompt.",
+    #     }
+    # )
 
     messages = cast(
         list[ChatCompletionMessageParam],
@@ -451,6 +489,9 @@ def main() -> None:
         max_tokens=8192,
         response_format={"type": "json_object"},
         messages=messages,
+        extra_body={
+            "mm_processor_kwargs": {"fps": video_sampling_fps, "do_sample_frames": True},
+        }, 
     )
     print(f"Response costs: {time.time() - start:.2f}s")
 
@@ -464,8 +505,7 @@ def main() -> None:
     if is_missing_response_content(content):
         should_rerun = True
         rerun_reason = (
-            "Detected empty sparse trajectory output; rerunning generation with a stronger "
-            "sparse coverage reminder."
+            "Detected empty sparse trajectory output; rerunning generation with a stronger reminder."
         )
     else:
         strided_trajectory_json = extract_json_from_response(
@@ -473,14 +513,14 @@ def main() -> None:
             model_name=model_name,
             content=content,
             output_dir=args.strided_trajectory_out.parent,
-            base_name="strided_trajectory",
+            base_name="sparse_camera_trajectory",
             finish_reason=response.choices[0].finish_reason,
-            required_top_level_key="strided_camera_trajectory_pixels",
-            label="strided trajectory",
+            required_top_level_key="sparse_camera_trajectory",
+            label="sparse trajectory",
         )
         normalized_strided_positions = extract_trajectory_positions(
             strided_trajectory_json,
-            top_level_key="strided_camera_trajectory_pixels",
+            top_level_key="sparse_camera_trajectory",
         )
         missing_frame_keys = get_missing_required_keys(
             normalized_strided_positions, sparse_frame_keys
@@ -488,8 +528,7 @@ def main() -> None:
         if missing_frame_keys:
             should_rerun = True
             rerun_reason = (
-                "Detected incomplete sparse trajectory output; rerunning generation with a stronger "
-                "sparse coverage reminder."
+                "Detected missing keys in the trajectory output; rerunning generation with a stronger reminder."
             )
 
     if should_rerun:
@@ -526,6 +565,9 @@ def main() -> None:
             max_tokens=8192,
             response_format={"type": "json_object"},
             messages=rerun_messages,
+            extra_body={
+                "mm_processor_kwargs": {"fps": video_sampling_fps, "do_sample_frames": True},
+            }, 
         )
         print(f"Rerun response costs: {time.time() - rerun_start:.2f}s")
 
@@ -540,14 +582,14 @@ def main() -> None:
             model_name=model_name,
             content=rerun_content,
             output_dir=args.strided_trajectory_out.parent,
-            base_name="strided_trajectory_rerun",
+            base_name="sparse_camera_trajectory",
             finish_reason=rerun_response.choices[0].finish_reason,
-            required_top_level_key="strided_camera_trajectory_pixels",
-            label="strided trajectory rerun",
+            required_top_level_key="sparse_camera_trajectory",
+            label="sparse trajectory rerun",
         )
         normalized_strided_positions = extract_trajectory_positions(
             strided_trajectory_json,
-            top_level_key="strided_camera_trajectory_pixels",
+            top_level_key="sparse_camera_trajectory",
         )
         missing_frame_keys = get_missing_required_keys(
             normalized_strided_positions, sparse_frame_keys
@@ -560,7 +602,7 @@ def main() -> None:
             )
 
     strided_output = {
-        "strided_camera_trajectory_pixels": {
+        "sparse_camera_trajectory": {
             key: {"position": list(value["position"])}
             for key, value in sorted(
                 normalized_strided_positions.items(),
@@ -571,15 +613,15 @@ def main() -> None:
     }
     dense_output = {
         "camera_trajectory_pixels": interpolate_dense_trajectory(
-            strided_output["strided_camera_trajectory_pixels"],
+            strided_output["sparse_camera_trajectory"],
             num_frames=args.num_frames,
         )
     }
 
-    strided_viz_path = args.strided_trajectory_out.parent / "trajectory_strided_topdown.mp4"
+    strided_viz_path = args.strided_trajectory_out.parent / "sparse_trajectory_topdown.mp4"
     visualize_strided_trajectory(
         output_video_path=strided_viz_path,
-        strided_positions=strided_output["strided_camera_trajectory_pixels"],
+        strided_positions=strided_output["sparse_camera_trajectory"],
         semantic_metadata=semantic_metadata,
         source_traj_path=scene_root / "pred_traj.txt",
         intrinsics_path=scene_root / "pred_intrinsics.txt",

@@ -17,7 +17,7 @@ from pytorch3d.renderer import (
 from pytorch3d.structures import Pointclouds
 
 """
-python render_scene_from_vlm_cameras.py \
+python agents/render_scene_from_vlm_cameras.py \
 --data_dir demo_tmp/davis/tennis/normalized_nofilter \
 --traj_path lifted_pred_traj.txt \
 --output_dir renders_vlm_lifted
@@ -109,8 +109,10 @@ def main() -> None:
     ply_dir = Path(args.ply_dir) if args.ply_dir else data_dir / "all_points"
     output_dir = Path(args.output_dir) if args.output_dir else data_dir / "renders_vlm_lifted"
     frames_dir = output_dir / "frames"
+    mask_frames_dir = output_dir / "mask_frames"
     video_dir = output_dir / "vis-videos"
     frames_dir.mkdir(parents=True, exist_ok=True)
+    mask_frames_dir.mkdir(parents=True, exist_ok=True)
     video_dir.mkdir(parents=True, exist_ok=True)
 
     if not traj_path.exists():
@@ -145,7 +147,9 @@ def main() -> None:
         points = cloud.points_list()[0]
         if points.numel() == 0:
             img_np = np.zeros((h, w, 3), dtype=np.uint8)
+            mask_np = np.full((h, w, 3), 255, dtype=np.uint8)
             Image.fromarray(img_np).save(frames_dir / f"{i:04d}.png")
+            Image.fromarray(mask_np).save(mask_frames_dir / f"{i:04d}.png")
             continue
 
         features = cloud.features_list()[0]
@@ -185,18 +189,27 @@ def main() -> None:
             image_size=image_size,
             device=device,
         )
+        rasterizer = PointsRasterizer(cameras=camera, raster_settings=raster_settings)
         renderer = PointsRenderer(
-            rasterizer=PointsRasterizer(cameras=camera, raster_settings=raster_settings),
-            compositor=AlphaCompositor(),
+            rasterizer=rasterizer,
+            compositor=AlphaCompositor(background_color=torch.tensor([0.5, 0.5, 0.5], device=device)),
         )
         image = renderer(pc)[0, ..., :3].detach().cpu().numpy().clip(0, 1)
+        fragments = rasterizer(pc)
+        occupied = (fragments.idx[0, ..., 0] >= 0).detach().cpu().numpy()
+        mask = np.where(occupied, 0, 255).astype(np.uint8)
+        mask = np.repeat(mask[..., None], 3, axis=2)
         Image.fromarray((image * 255).astype(np.uint8)).save(frames_dir / f"{i:04d}.png")
+        Image.fromarray(mask).save(mask_frames_dir / f"{i:04d}.png")
         print(f"Rendered {i + 1}/{n}", end="\r")
 
     print()
     create_video_from_frames(str(frames_dir / "%04d.png"), video_dir / "render.mp4", fps=args.fps)
+    create_video_from_frames(str(mask_frames_dir / "%04d.png"), video_dir / "mask.mp4", fps=args.fps)
     print(f"Saved frames to: {frames_dir}")
+    print(f"Saved mask frames to: {mask_frames_dir}")
     print(f"Saved video to: {video_dir / 'render.mp4'}")
+    print(f"Saved mask video to: {video_dir / 'mask.mp4'}")
 
 
 if __name__ == "__main__":

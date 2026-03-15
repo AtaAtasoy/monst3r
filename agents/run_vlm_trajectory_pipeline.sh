@@ -2,20 +2,27 @@
 set -euo pipefail
 export LC_ALL=C
 
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -d "${SCRIPT_DIR}/agents" ]]; then
+  REPO_ROOT="$SCRIPT_DIR"
+else
+  REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+fi
+
+cd "$REPO_ROOT"
 
 usage() {
   cat <<'EOF'
 Usage:
-  ./run_vlm_trajectory_pipeline.sh [options]
+  ./agents/run_vlm_trajectory_pipeline.sh [options]
 
 Runs:
   1) VLM trajectory generation (agents/cinematographer.py)
-  2) UV->3D lifting (lift_uv_traj_to_3d.py)
-  3) Top-down visualization of generated NPZ trajectory (visualize_custom_trajectory.py)
-  4) NPZ trajectory conversion and top-down visualization (visualize_generated_trajectory_topdown.py)
-  5) Top-down visualization of generated cameras (TUM) (visualize_generated_trajectory_topdown.py)
-  6) Rendering from lifted cameras (render_scene_from_vlm_cameras.py)
+  2) UV->3D lifting (agents/lift_uv_traj_to_3d.py)
+  3) Top-down visualization of generated NPZ trajectory (agents/visualize_custom_trajectory.py)
+  4) NPZ trajectory conversion and top-down visualization (agents/visualize_generated_trajectory_topdown.py)
+  5) Top-down visualization of generated cameras (TUM) (agents/visualize_generated_trajectory_topdown.py)
+  6) Rendering from lifted cameras (agents/render_scene_from_vlm_cameras.py)
   7) Critic evaluation (agents/critic.py)
 
 Outputs are saved to:
@@ -31,7 +38,7 @@ Options:
   --score-threshold FLOAT       Stop loop when score >= threshold (default: 8.0)
   --data-dir PATH               Scene dir used by renderer/lift source (default: demo_tmp/davis/tennis/normalized_nofilter)
   --dense-trajectory-json PATH  Input dense trajectory JSON when using --skip-generate (default: camera_trajectory_pixels.json)
-  --strided-trajectory-json PATH
+  --sparse-trajectory-json PATH
                                 Input sparse trajectory JSON when using --skip-generate
   --semantic-metadata PATH      semantic_topdown_metadata.json (default: <data-dir>/top-down-semantic-ortho-all-scene/semantic_topdown_metadata.json)
   --source-traj PATH            Source TUM trajectory for orientation/depth (default: <data-dir>/pred_traj.txt)
@@ -111,7 +118,7 @@ while [[ $# -gt 0 ]]; do
       DENSE_TRAJECTORY_JSON="$2"
       shift 2
       ;;
-    --strided-trajectory-json)
+    --sparse-trajectory-json)
       STRIDED_TRAJECTORY_JSON="$2"
       shift 2
       ;;
@@ -297,7 +304,7 @@ for ((i=0; i<EFFECTIVE_MAX_ITER; i++)); do
   CRITIC_OUTPUT_DIR="${ITER_DIR}/05_critic"
   mkdir -p "$VLM_DIR" "$LIFT_DIR" "$NPZ_VIZ_3D_OUTPUT_DIR" "$TOPDOWN_VIZ_OUTPUT_DIR" "$TOPDOWN_NPZ_VIZ_OUTPUT_DIR" "$RENDER_OUTPUT_DIR" "$CRITIC_OUTPUT_DIR"
 
-  VLM_STRIDED_TRAJECTORY_JSON="${VLM_DIR}/strided_camera_trajectory_pixels.json"
+  VLM_STRIDED_TRAJECTORY_JSON="${VLM_DIR}/sparse_camera_trajectory.json"
   VLM_DENSE_TRAJECTORY_JSON="${VLM_DIR}/camera_trajectory_pixels.json"
   VLM_REASONING_TXT="${VLM_DIR}/reasoning.txt"
   VLM_USER_DEMAND_TXT="${VLM_DIR}/user_demand.txt"
@@ -324,7 +331,7 @@ for ((i=0; i<EFFECTIVE_MAX_ITER; i++)); do
     )
     if [[ "$i" -gt 0 ]]; then
       GEN_CMD+=(--critic-feedback-json "$PREV_CRITIC_JSON")
-      GEN_CMD+=(--prior-strided-trajectory-json "$PREV_STRIDED_TRAJECTORY_JSON")
+      GEN_CMD+=(--prior-sparse-trajectory-json "$PREV_STRIDED_TRAJECTORY_JSON")
     fi
     CUDA_VISIBLE_DEVICES=1 "${GEN_CMD[@]}"
   else
@@ -361,7 +368,7 @@ for ((i=0; i<EFFECTIVE_MAX_ITER; i++)); do
   fi
 
   echo "[${ITER_ID}][2/7] Lifting UV trajectory to 3D..."
-  CUDA_VISIBLE_DEVICES=1 python lift_uv_traj_to_3d.py \
+  CUDA_VISIBLE_DEVICES=1 python agents/lift_uv_traj_to_3d.py \
     --trajectory_json "$VLM_DENSE_TRAJECTORY_JSON" \
     --semantic_metadata_json "$SEMANTIC_METADATA_JSON" \
     --source_traj_txt "$SOURCE_TRAJ_TXT" \
@@ -387,7 +394,7 @@ for ((i=0; i<EFFECTIVE_MAX_ITER; i++)); do
     exit 1
   fi
   echo "[${ITER_ID}][3/7] Visualizing lifted NPZ trajectory in 3D..."
-  CUDA_VISIBLE_DEVICES=1 python visualize_custom_trajectory.py \
+  CUDA_VISIBLE_DEVICES=1 python agents/visualize_custom_trajectory.py \
     --pose_path "$LIFTED_NPZ_CANON" \
     --output_path "${NPZ_VIZ_3D_OUTPUT_DIR}/lifted_pred_traj_3d.png" \
     --step_size 10 \
@@ -395,27 +402,27 @@ for ((i=0; i<EFFECTIVE_MAX_ITER; i++)); do
     --frustum_size 0.03
 
   echo "[${ITER_ID}][4/7] Visualizing lifted NPZ trajectory in top-down scene..."
-  CUDA_VISIBLE_DEVICES=1 python visualize_generated_trajectory_topdown.py \
+  CUDA_VISIBLE_DEVICES=1 python agents/visualize_generated_trajectory_topdown.py \
     --semantic_metadata_json "$SEMANTIC_METADATA_JSON" \
     --generated_traj_npz "$LIFTED_NPZ_CANON" \
     --source_traj_txt "$SOURCE_TRAJ_TXT" \
     --intrinsics_path "${DATA_DIR}/pred_intrinsics.txt" \
     --scene_ply_dir "${DATA_DIR}/all_points" \
     --output_dir "$TOPDOWN_NPZ_VIZ_OUTPUT_DIR" \
-    --fps "$FPS" \
+    --fps "$FPS"
 
   echo "[${ITER_ID}][5/7] Visualizing generated cameras in top-down scene (TUM)..."
-  CUDA_VISIBLE_DEVICES=1 python visualize_generated_trajectory_topdown.py \
+  CUDA_VISIBLE_DEVICES=1 python agents/visualize_generated_trajectory_topdown.py \
     --semantic_metadata_json "$SEMANTIC_METADATA_JSON" \
     --generated_traj_txt "$LIFTED_TUM_CANON" \
     --source_traj_txt "$SOURCE_TRAJ_TXT" \
     --intrinsics_path "${DATA_DIR}/pred_intrinsics.txt" \
     --scene_ply_dir "${DATA_DIR}/all_points" \
     --output_dir "$TOPDOWN_VIZ_OUTPUT_DIR" \
-    --fps "$FPS" \
+    --fps "$FPS"
 
   echo "[${ITER_ID}][6/7] Rendering scene from lifted cameras..."
-  CUDA_VISIBLE_DEVICES=1 python render_scene_from_vlm_cameras.py \
+  CUDA_VISIBLE_DEVICES=1 python agents/render_scene_from_vlm_cameras.py \
     --data_dir "$DATA_DIR" \
     --traj_path "$LIFTED_TUM_CANON" \
     --output_dir "$RENDER_OUTPUT_DIR" \
@@ -427,24 +434,24 @@ for ((i=0; i<EFFECTIVE_MAX_ITER; i++)); do
   fi
 
   TOPDOWN_VIDEO_PATH="${TOPDOWN_VIZ_OUTPUT_DIR}/generated_topdown_trajectory.mp4"
+  if [[ ! -f "$TOPDOWN_VIDEO_PATH" ]]; then
+    echo "Missing topdown generated cameras video output: ${TOPDOWN_VIDEO_PATH}" >&2
+    exit 1
+  fi
   if [[ "$SKIP_CRITIC" == "0" ]]; then
     echo "[${ITER_ID}][7/7] Evaluating generated trajectory with critic..."
     CRITIC_CMD=(
       python -m agents.critic
       --model "$CRITIC_MODEL"
       --user-demand "$USER_DEMAND"
-      --strided-trajectory-json "$VLM_STRIDED_TRAJECTORY_JSON"
-      --render-video "${RENDER_OUTPUT_DIR}/vis-videos/render.mp4"
+      --sparse-trajectory-json "$VLM_STRIDED_TRAJECTORY_JSON"
+      --generated-cameras-render-video "${RENDER_OUTPUT_DIR}/vis-videos/render.mp4"
+      --generated-cameras-topdown-video "$TOPDOWN_VIDEO_PATH"
       --critic-out "$CRITIC_RESULT_CANON"
       --reasoning-out "$CRITIC_REASONING_CANON"
       --inputs-dir "$CRITIC_INPUTS_DIR"
       --num-frames "$NUM_FRAMES"
     )
-    if [[ -f "$TOPDOWN_VIDEO_PATH" ]]; then
-      CRITIC_CMD+=(--topdown-video "$TOPDOWN_VIDEO_PATH")
-    else
-      echo "Topdown video not found at ${TOPDOWN_VIDEO_PATH}; critic will run with render-only evidence."
-    fi
     CUDA_VISIBLE_DEVICES=1 "${CRITIC_CMD[@]}"
   else
     echo "[${ITER_ID}][7/7] Skipping critic step (--skip-critic)."
@@ -553,7 +560,7 @@ printf '%s\n' "$FINAL_ITER_ID" > "${EXPERIMENT_DIR}/final_iteration.txt"
 ln -sfn "iterations/${BEST_ITER_ID}" "${EXPERIMENT_DIR}/final"
 
 BEST_ITER_DIR="${ITERATIONS_DIR}/${BEST_ITER_ID}"
-FINAL_STRIDED_TRAJECTORY_JSON="${BEST_ITER_DIR}/01_vlm/strided_camera_trajectory_pixels.json"
+FINAL_STRIDED_TRAJECTORY_JSON="${BEST_ITER_DIR}/01_vlm/sparse_camera_trajectory.json"
 FINAL_DENSE_TRAJECTORY_JSON="${BEST_ITER_DIR}/01_vlm/camera_trajectory_pixels.json"
 FINAL_REASONING_TXT="${BEST_ITER_DIR}/01_vlm/reasoning.txt"
 FINAL_USER_DEMAND_TXT="${BEST_ITER_DIR}/01_vlm/user_demand.txt"
@@ -621,7 +628,7 @@ for p in iteration_dirs:
             "overall_quality_score": score,
             "artifacts": {
                 "strided_trajectory_json": path_obj(
-                    str(p / "01_vlm" / "strided_camera_trajectory_pixels.json")
+                    str(p / "01_vlm" / "sparse_camera_trajectory.json")
                 ),
                 "dense_trajectory_json": path_obj(
                     str(p / "01_vlm" / "camera_trajectory_pixels.json")

@@ -160,13 +160,14 @@ def normalize_scene(
                 os.path.join(dst_dir, fname)
             )
 
-    # ── Copy images / depth / confidence ─────────────────────
+    # ── Copy images / depth / confidence / masks ─────────────────────
     num_frames = len(traj)
     for i in range(num_frames):
         # PNG
         img_src = os.path.join(base_dir, f"frame_{i:04d}.png")
-        if os.path.exists(img_src):
-            shutil.copy(img_src, os.path.join(out_root, f"frame_{i:04d}.png"))
+        img_dst = os.path.join(out_root, f"frame_{i:04d}.png")
+        if os.path.exists(img_src) and not os.path.exists(img_dst):
+            os.symlink(os.path.abspath(img_src), img_dst)
 
         # Depth NPY (scale depth by normalization scale)
         depth_src = os.path.join(base_dir, f"frame_{i:04d}.npy")
@@ -174,10 +175,11 @@ def normalize_scene(
             depth = np.load(depth_src)
             np.save(os.path.join(out_root, f"frame_{i:04d}.npy"), depth * scale)
 
-        # Confidence NPY (unchanged)
+        # Confidence NPY
         conf_src = os.path.join(base_dir, f"conf_{i}.npy")
-        if os.path.exists(conf_src):
-            shutil.copy(conf_src, os.path.join(out_root, f"conf_{i}.npy"))
+        conf_dst = os.path.join(out_root, f"conf_{i}.npy")
+        if os.path.exists(conf_src) and not os.path.exists(conf_dst):
+            os.symlink(os.path.abspath(conf_src), conf_dst)
 
     print(f"  Normalized scene saved to {out_root}")
     return norm_params

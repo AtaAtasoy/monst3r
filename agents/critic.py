@@ -1,6 +1,8 @@
 import argparse
 import json
+import os
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -9,7 +11,7 @@ from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
 from .vlm_response_utils import is_missing_response_content
-from .io import save_base64_png, read_text, load_video_keyframes
+from .io import read_text, save_sampled_video_frames
 
 
 def render_system_prompt(*, num_frames: int, sparse_frame_keys: list[str]) -> str:
@@ -30,9 +32,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--user-demand", type=str, required=True)
-    parser.add_argument("--strided-trajectory-json", type=Path, required=True)
-    parser.add_argument("--render-video", type=Path, required=True)
-    parser.add_argument("--topdown-video", type=Path, default=None)
+    parser.add_argument("--sparse-trajectory-json", type=Path, required=True)
+    parser.add_argument("--generated-cameras-render-video", type=Path, required=True)
+    parser.add_argument("--generated-cameras-topdown-video", type=Path, required=True)
     parser.add_argument("--critic-out", type=Path, required=True)
     parser.add_argument("--reasoning-out", type=Path, required=True)
     parser.add_argument("--inputs-dir", type=Path, required=True)
@@ -40,12 +42,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def extract_sparse_frame_keys(strided_trajectory_text: str) -> list[str]:
-    data = json.loads(strided_trajectory_text)
-    traj = data.get("strided_camera_trajectory_pixels")
+def extract_sparse_frame_keys(sparse_trajectory_text: str) -> list[str]:
+    data = json.loads(sparse_trajectory_text)
+    traj = data.get("sparse_camera_trajectory")
     if not isinstance(traj, dict):
         raise RuntimeError(
-            "`strided_trajectory_json` must contain `strided_camera_trajectory_pixels` as an object"
+            "`strided_trajectory_json` must contain `sparse_camera_trajectory` as an object"
         )
 
     indexed_keys: list[tuple[int, str]] = []
@@ -67,6 +69,17 @@ def extract_sparse_frame_keys(strided_trajectory_text: str) -> list[str]:
 
     indexed_keys.sort(key=lambda item: item[0])
     return [key for _, key in indexed_keys]
+
+
+def link_or_copy_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        return
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copyfile(source, target)
+
 
 def validate_critic_output(
     data: dict[str, Any],
@@ -134,17 +147,21 @@ def main() -> None:
     if not model_name:
         raise ValueError("`--model` cannot be empty.")
 
-    if not args.strided_trajectory_json.exists():
+    if not args.sparse_trajectory_json.exists():
         raise FileNotFoundError(
-            f"Missing strided trajectory json: {args.strided_trajectory_json}"
+            f"Missing sparse trajectory json: {args.sparse_trajectory_json}"
         )
-    if not args.render_video.exists():
-        raise FileNotFoundError(f"Missing render video: {args.render_video}")
+    if not args.generated_cameras_render_video.exists():
+        raise FileNotFoundError(
+            f"Missing render video: {args.generated_cameras_render_video}"
+        )
+    if not args.generated_cameras_topdown_video.exists():
+        raise FileNotFoundError(
+            f"Missing topdown video: {args.generated_cameras_topdown_video}"
+        )
 
-    topdown_available = args.topdown_video is not None and args.topdown_video.exists()
-
-    strided_trajectory_text = read_text(args.strided_trajectory_json)
-    sparse_frame_keys = extract_sparse_frame_keys(strided_trajectory_text)
+    sparse_trajectory_text = read_text(args.sparse_trajectory_json)
+    sparse_frame_keys = extract_sparse_frame_keys(sparse_trajectory_text)
     allowed_sparse_keys = set(sparse_frame_keys)
 
     if args.num_frames is None:
@@ -156,39 +173,24 @@ def main() -> None:
 
     system_prompt = render_system_prompt(
         num_frames=num_frames,
-        sparse_frame_keys=cast(list[str], sparse_frame_keys),
+        sparse_frame_keys=sparse_frame_keys,
     )
-    render_first, render_last = load_video_keyframes(args.render_video)
+    sparse_viz_path = args.sparse_trajectory_json.parent / "trajectory_strided_topdown.mp4"
+    sparse_viz_available = sparse_viz_path.exists()
 
-    topdown_first = None
-    topdown_last = None
-    if topdown_available and args.topdown_video is not None:
-        topdown_first, topdown_last = load_video_keyframes(args.topdown_video)
-
-    strided_viz_path = args.strided_trajectory_json.parent / "trajectory_strided_topdown.mp4"
-    strided_viz_available = strided_viz_path.exists()
-    strided_viz_first = None
-    strided_viz_last = None
-    if strided_viz_available:
-        strided_viz_first, strided_viz_last = load_video_keyframes(strided_viz_path)
-
-    artifact_manifest_lines = [
-        "Artifact Manifest:",
-        f"- User Demand: {user_demand}",
-        f"- Sparse 2D Trajectory JSON: {args.strided_trajectory_json.name}",
-        f"- Rendered Video: {args.render_video.name} (keyframes: first,last)",
-        (
-            f"- Sparse Trajectory Topdown Video: {strided_viz_path.name}"
-            if strided_viz_available
-            else "- Sparse Trajectory Topdown Video: N/A"
-        ),
-        (
-            f"- Topdown Generated Trajectory Video: {args.topdown_video.name}"
-            if topdown_available and args.topdown_video is not None
-            else "- Topdown Generated Trajectory Video: N/A"
-        ),
-    ]
-    artifact_manifest_text = "\n".join(artifact_manifest_lines)
+    # artifact_manifest_lines = [
+    #     "Artifact Manifest:",
+    #     f"- User Demand: {user_demand}",
+    #     f"- Sparse 2D Trajectory JSON: {args.sparse_trajectory_json.name}",
+    #     f"- Generated Camera Renderings Video: {args.generated_cameras_render_video.name}",
+    #     f"- Generated Cameras Topdown Video: {args.generated_cameras_topdown_video.name}",
+    #     (
+    #         f"- Sparse Trajectory Topdown Video: {sparse_viz_path.name}"
+    #         if sparse_viz_available
+    #         else "- Sparse Trajectory Topdown Video: N/A"
+    #     ),
+    # ]
+    # artifact_manifest_text = "\n".join(artifact_manifest_lines)
 
     visual_inputs_dir = args.inputs_dir / "visual"
     language_inputs_dir = args.inputs_dir / "language"
@@ -198,115 +200,57 @@ def main() -> None:
     visual_input_records: list[dict[str, int | str | bool]] = [
         {
             "order": 0,
-            "file_name": "input_000__rendered_video__render_mp4__keyframe_0000.png",
-            "role": "rendered_video_keyframe",
-            "source": str(args.render_video.name),
-            "frame_index": 0,
+            "file_type": "video",
+            "file_name": "generated_cameras_render.mp4",
+            "role": "generated_cameras_render_video",
+            "source": str(args.generated_cameras_render_video),
             "available": True,
-            "image_base64": render_first,
         },
         {
             "order": 1,
-            "file_name": "input_001__rendered_video__render_mp4__keyframe_last.png",
-            "role": "rendered_video_keyframe",
-            "source": str(args.render_video.name),
-            "frame_index": -1,
+            "file_type": "video",
+            "file_name": "generated_cameras_topdown.mp4",
+            "role": "generated_cameras_topdown_video",
+            "source": str(args.generated_cameras_topdown_video),
             "available": True,
-            "image_base64": render_last,
         },
         {
             "order": 2,
-            "file_name": "input_002__strided_topdown_viz__trajectory_strided_topdown_mp4__keyframe_0000.png",
-            "role": "strided_topdown_video_keyframe",
-            "source": str(strided_viz_path.name),
-            "frame_index": 0,
-            "available": strided_viz_available,
-            "image_base64": strided_viz_first if strided_viz_first is not None else "",
+            "file_type": "video",
+            "file_name": "sparse_trajectory_topdown.mp4",
+            "role": "sparse_trajectory_topdown_video",
+            "source": str(sparse_viz_path),
+            "available": sparse_viz_available,
             "note": (
                 ""
-                if strided_viz_available
-                else "Sparse topdown video missing; critic will use sparse JSON directly."
-            ),
-        },
-        {
-            "order": 3,
-            "file_name": "input_003__strided_topdown_viz__trajectory_strided_topdown_mp4__keyframe_last.png",
-            "role": "strided_topdown_video_keyframe",
-            "source": str(strided_viz_path.name),
-            "frame_index": -1,
-            "available": strided_viz_available,
-            "image_base64": strided_viz_last if strided_viz_last is not None else "",
-            "note": (
-                ""
-                if strided_viz_available
+                if sparse_viz_available
                 else "Sparse topdown video missing; critic will use sparse JSON directly."
             ),
         },
     ]
 
-    if topdown_available and topdown_first is not None and topdown_last is not None:
-        visual_input_records.extend(
-            [
-                {
-                    "order": 4,
-                    "file_name": "input_004__topdown_viz__generated_topdown_trajectory_mp4__keyframe_0000.png",
-                    "role": "topdown_video_keyframe",
-                    "source": str(args.topdown_video.name if args.topdown_video else "N/A"),
-                    "frame_index": 0,
-                    "available": True,
-                    "image_base64": topdown_first,
-                },
-                {
-                    "order": 5,
-                    "file_name": "input_005__topdown_viz__generated_topdown_trajectory_mp4__keyframe_last.png",
-                    "role": "topdown_video_keyframe",
-                    "source": str(args.topdown_video.name if args.topdown_video else "N/A"),
-                    "frame_index": -1,
-                    "available": True,
-                    "image_base64": topdown_last,
-                },
-            ]
-        )
-    else:
-        visual_input_records.extend(
-            [
-                {
-                    "order": 4,
-                    "file_name": "input_004__topdown_viz__generated_topdown_trajectory_mp4__keyframe_0000.png",
-                    "role": "topdown_video_keyframe",
-                    "source": str(args.topdown_video.name if args.topdown_video else "N/A"),
-                    "frame_index": 0,
-                    "available": False,
-                    "note": "Topdown video missing; skipped visual attachment.",
-                },
-                {
-                    "order": 5,
-                    "file_name": "input_005__topdown_viz__generated_topdown_trajectory_mp4__keyframe_last.png",
-                    "role": "topdown_video_keyframe",
-                    "source": str(args.topdown_video.name if args.topdown_video else "N/A"),
-                    "frame_index": -1,
-                    "available": False,
-                    "note": "Topdown video missing; skipped visual attachment.",
-                },
-            ]
-        )
-
     for record in visual_input_records:
-        if bool(record.get("available", False)):
-            save_base64_png(
-                str(record["image_base64"]),
-                visual_inputs_dir / str(record["file_name"]),
-            )
+        if not bool(record.get("available", False)):
+            continue
+        source_video = Path(str(record["source"]))
+        target_video = visual_inputs_dir / str(record["file_name"])
+        link_or_copy_file(source_video, target_video)
+        save_sampled_video_frames(
+            target_video,
+            visual_inputs_dir / f"{target_video.stem}__sampled_frames",
+            fps=2.0,
+            backend="opencv",
+        )
 
     visual_manifest: list[dict[str, int | str | bool]] = []
     for record in visual_input_records:
         visual_manifest.append(
             {
                 "order": int(record["order"]),
+                "file_type": str(record["file_type"]),
                 "file_name": str(record["file_name"]),
                 "role": str(record["role"]),
                 "source": str(record["source"]),
-                "frame_index": int(record["frame_index"]),
                 "available": bool(record.get("available", False)),
                 "note": str(record.get("note", "")),
             }
@@ -316,32 +260,33 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    user_text_blocks = [
-        artifact_manifest_text,
-        f"User Demand: {user_demand}",
-        "Sparse 2D Camera Control Trajectory JSON:",
-        strided_trajectory_text,
-        "Return JSON only, using the exact schema specified in the system prompt.",
-    ]
+    # user_text_blocks = [
+    #     artifact_manifest_text,
+    #     f"User Demand: {user_demand}",
+    #     "Sparse 2D Camera Control Trajectory JSON:",
+    #     sparse_trajectory_text,
+    #     "Return JSON only, using the exact schema specified in the system prompt.",
+    # ]
     (language_inputs_dir / "system_prompt.txt").write_text(system_prompt, encoding="utf-8")
-    (language_inputs_dir / "artifact_manifest.txt").write_text(
-        f"{artifact_manifest_text}\n", encoding="utf-8"
+    # (language_inputs_dir / "artifact_manifest.txt").write_text(
+    #     f"{artifact_manifest_text}\n", encoding="utf-8"
+    # )
+    (language_inputs_dir / "sparse_camera_trajectory.json").write_text(
+        sparse_trajectory_text, encoding="utf-8"
     )
-    (language_inputs_dir / "strided_camera_trajectory_pixels.json").write_text(
-        strided_trajectory_text, encoding="utf-8"
-    )
-    (language_inputs_dir / "user_text_blocks.json").write_text(
-        json.dumps(user_text_blocks, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    # (language_inputs_dir / "user_text_blocks.json").write_text(
+    #     json.dumps(user_text_blocks, indent=2, ensure_ascii=False),
+    #     encoding="utf-8",
+    # )
     (language_inputs_dir / "request_config.json").write_text(
         json.dumps(
             {
                 "model": model_name,
                 "response_format": {"type": "json_object"},
                 "max_tokens": 4096 * 2,
-                "topdown_video_available": topdown_available,
-                "strided_topdown_video_available": strided_viz_available,
+                "topdown_video_available": True,
+                "strided_topdown_video_available": sparse_viz_available,
+                "mm_processor_kwargs": {"fps": 2.0, "do_sample_frames": True},
                 "sparse_frame_keys": sparse_frame_keys,
                 "num_frames": num_frames,
             },
@@ -352,31 +297,32 @@ def main() -> None:
     )
     print(f"Saved critic inputs to: {args.inputs_dir}")
 
+    generated_render_video = (visual_inputs_dir / "generated_cameras_render.mp4").resolve()
+    generated_topdown_video = (visual_inputs_dir / "generated_cameras_topdown.mp4").resolve()
+    sparse_topdown_video = (visual_inputs_dir / "sparse_trajectory_topdown.mp4").resolve()
+
     user_content: list[dict[str, object]] = [
-        {"type": "text", "text": artifact_manifest_text},
+        # {"type": "text", "text": artifact_manifest_text},
         {"type": "text", "text": f"User Demand: {user_demand}"},
-        {"type": "text", "text": "Rendered Video Keyframe 1 (first):"},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{render_first}"}},
-        {"type": "text", "text": "Rendered Video Keyframe 2 (last):"},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{render_last}"}},
+        {
+            "type": "text",
+            "text": "Generated camera renderings video from the generated camera trajectory:",
+        },
+        {"type": "video_url", "video_url": {"url": generated_render_video.as_uri()}},
+        {
+            "type": "text",
+            "text": "Top-down video of generated cameras trajectory:",
+        },
+        {"type": "video_url", "video_url": {"url": generated_topdown_video.as_uri()}},
     ]
 
-    if (
-        strided_viz_available
-        and strided_viz_first is not None
-        and strided_viz_last is not None
-    ):
+    if sparse_viz_available:
         user_content.extend(
             [
-                {"type": "text", "text": "Sparse Trajectory Topdown Video Keyframe 1 (first):"},
+                {"type": "text", "text": "Top-down video of sparse trajectory control points:"},
                 {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{strided_viz_first}"},
-                },
-                {"type": "text", "text": "Sparse Trajectory Topdown Video Keyframe 2 (last):"},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{strided_viz_last}"},
+                    "type": "video_url",
+                    "video_url": {"url": sparse_topdown_video.as_uri()},
                 },
             ]
         )
@@ -388,33 +334,10 @@ def main() -> None:
             }
         )
 
-    if topdown_available and topdown_first is not None and topdown_last is not None:
-        user_content.extend(
-            [
-                {"type": "text", "text": "Topdown Trajectory Keyframe 1 (first):"},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{topdown_first}"},
-                },
-                {"type": "text", "text": "Topdown Trajectory Keyframe 2 (last):"},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{topdown_last}"},
-                },
-            ]
-        )
-    else:
-        user_content.append(
-            {
-                "type": "text",
-                "text": "Topdown trajectory video is unavailable for this run. Evaluate using rendered video and sparse trajectory artifacts.",
-            }
-        )
-
     user_content.extend(
         [
             {"type": "text", "text": "Sparse 2D Camera Control Trajectory JSON:"},
-            {"type": "text", "text": strided_trajectory_text},
+            {"type": "text", "text": sparse_trajectory_text},
             {
                 "type": "text",
                 "text": "Return JSON only, using the exact schema specified in the system prompt.",
@@ -438,6 +361,9 @@ def main() -> None:
         max_tokens=4096 * 2,
         response_format={"type": "json_object"},
         messages=messages,
+        extra_body={
+            "mm_processor_kwargs": {"fps": 2.0, "do_sample_frames": True},
+        },
     )
     print(f"Response costs: {time.time() - start:.2f}s")
 
@@ -477,6 +403,9 @@ def main() -> None:
             max_tokens=4096 * 2,
             response_format={"type": "json_object"},
             messages=rerun_messages,
+            extra_body={
+                "mm_processor_kwargs": {"fps": 2.0, "do_sample_frames": True},
+            },
         )
         print(f"Rerun response costs: {time.time() - rerun_start:.2f}s")
 

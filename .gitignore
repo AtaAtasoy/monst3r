@@ -151,3 +151,6 @@ dmypy.json
 .pyre/
 zilejNuE
 waymo_processed.zip
+
+# demo data
+demo_data

@@ -101,7 +101,7 @@ def main():
         help="Output image path. Defaults to <pose_stem>_trajectory.png next to the pose file.",
     )
     parser.add_argument(
-        "--resolution", type=int, nargs=2, default=[512, 512],
+        "--resolution", type=int, nargs=2, default=[1920, 1080],
         metavar=("W", "H"), help="Output image resolution (default: 1920 1080)",
     )
     parser.add_argument(

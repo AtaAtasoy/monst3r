@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 """
-python lift_uv_traj_to_3d.py \
+python agents/lift_uv_traj_to_3d.py \
   --trajectory_json trajectory.json \
   --semantic_metadata_json demo_tmp/davis/tennis/normalized_nofilter/top-down-semantic-ortho-all-scene/semantic_topdown_metadata.json \
   --source_traj_txt demo_tmp/davis/tennis/normalized_nofilter/pred_traj.txt \
