@@ -14,8 +14,19 @@ import numpy as np
 from evo.core import sync
 from evo.core.metrics import PoseRelation, Unit
 from evo.core.trajectory import PosePath3D, PoseTrajectory3D
-from evo.tools import file_interface, plot
+from evo.tools import file_interface
+from evo.tools.settings import SETTINGS
 from scipy.spatial.transform import Rotation
+
+
+def _get_evo_plot():
+    """Import evo plotting lazily and force a headless-safe backend."""
+    if getattr(SETTINGS, "plot_backend", None) != "Agg":
+        SETTINGS.plot_backend = "Agg"
+
+    from evo.tools import plot as evo_plot
+
+    return evo_plot
 
 
 def sintel_cam_read(filename):
@@ -248,12 +259,14 @@ def eval_metrics(pred_traj, gt_traj=None, seq="", filename="", sample_stride=1):
 def best_plotmode(traj):
     _, i1, i2 = np.argsort(np.var(traj.positions_xyz, axis=0))
     plot_axes = "xyz"[i2] + "xyz"[i1]
+    plot = _get_evo_plot()
     return getattr(plot.PlotMode, plot_axes)
 
 
 def plot_trajectory(
     pred_traj, gt_traj=None, title="", filename="", align=True, correct_scale=True
 ):
+    plot = _get_evo_plot()
     pred_traj = make_traj(pred_traj)
 
     if gt_traj is not None:
